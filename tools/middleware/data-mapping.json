@@ -1,0 +1,233 @@
+{
+  "_doc": "hiksemi-sub 服务中间件 · 数据映射配置。本文件定义「hiksemi 程序 REST 字段 ↔ 操作系统数据源」的全部对应关系，改动保存即生效（无需重启服务）。source 类型：static=静态值 | file=读文件(可配 regex/cast/scale/format/default) | command=执行命令(同上) | hwmon=硬件传感器(chip/field/scale) | collector=内置采集器(cpu_percent/mem_percent/net_up/net_down/load1) | builder=复合构造器(disk_list/eth_list/space_list/update_desc/dev_status/disk_manage/space_manage)。",
+  "server": {
+    "listen": "127.0.0.1",
+    "port": 20443
+  },
+  "collectors": {
+    "_doc": "周期采集器参数。interval=采样间隔秒；net_ifaces 为空表示自动统计所有物理网卡（排除 lo）",
+    "interval": 2,
+    "net_ifaces": []
+  },
+  "stream": {
+    "_doc": "长连接（multipart --myboundary 分帧）配置。mode: auto=按 actions 列表决定(默认) | always=所有请求都流式 | never=全部退化为一次性 JSON(排障用)。actions 列出需要流式推送的 action；interval 为默认推送间隔(秒)，overrides 可按 action 单独覆盖。客户端 60s 无数据会断开重连。",
+    "mode": "auto",
+    "interval": 2,
+    "overrides": {
+      "get_event": 30
+    },
+    "actions": [
+      "get_hw_resource_info",
+      "get_event"
+    ]
+  },
+  "actions": {
+    "get_sys_info": {
+      "_doc": "设备基本信息：型号/MAC/绑定状态。★ 程序启动时先请求 /rest/1.1/openinfo 做绑定检测：is_active 必须为 1 才进主页，否则卡在绑定页。serial_number 会被写入 sessionStorage.deviceInfo.sn。",
+      "code": {
+        "source": "static",
+        "value": 0
+      },
+      "product_model": {
+        "source": "static",
+        "value": "HS-AFS-R1"
+      },
+      "serial_number": {
+        "source": "static",
+        "value": "FNOS-SUB-0001",
+        "_note": "序列号；程序会存进 deviceInfo.sn"
+      },
+      "mac": {
+        "source": "mac",
+        "default": "00:11:22:33:44:55",
+        "_note": "★ 自动探测主网卡 MAC。网卡名从 /sys/class/net 动态发现，绝不硬编码（飞牛OS 不存在 eth0，常见名 enp2s0 / enp3s0 / enp2s0-ovs）。★ 挑选依据是客观事实而非名字：有默认路由 > 有 IPv4 > operstate 为 up。带 -ovs 后缀的接口【不再跳过】—— 飞牛OS 的物理口就叫 enp2s0-ovs。如需固定：加 \"iface\": \"enp2s0-ovs\""
+      },
+      "is_active": {
+        "source": "static",
+        "value": 1,
+        "_note": "★ 1=已绑定（必须为 1，否则程序停在绑定页）"
+      },
+      "productLine": {
+        "source": "static",
+        "value": 1
+      }
+    },
+    "get_admin_accountid": {
+      "code": {
+        "source": "static",
+        "value": 0
+      },
+      "accountid": {
+        "source": "static",
+        "value": "1"
+      }
+    },
+    "get_hw_resource_info": {
+      "_doc": "★ 首页设备状态帧。客户端走【1.2/config 长连接】+ multipart 分帧（见顶层 stream）。帧内字段契约：cpu/memory 必须【裸数值】（字符串会让 JS 的 r.cpu>=0 变成 NaN>=0=false，整帧丢弃）；upload/download 是【数值 KB/s】（客户端自己 format）；fanmode 小写；cpu_temp/temperature 下划线；disk_manage 是盘位数组。",
+      "source": "builder",
+      "name": "dev_status",
+      "_doc_fanmode": "★ 动态返回：\"state\" 表示从 FanState 读当前档位（5智能/2低速/3标准/4强劲，与 UI FAN_LIST[].id 严格相等匹配）。如需临时固定排障，改成数字（如 5）或 { \"source\": \"static\", \"value\": 5 }。",
+      "fanmode": "state",
+      "cpu_temp": {
+        "source": "hwmon",
+        "chip": "auto",
+        "field": "temp1_input",
+        "scale": 0.001,
+        "default": 45,
+        "_note": "CPU 温度（℃）。hwmon chip=auto 会自动挑一个温度传感器；取不到用 default"
+      },
+      "temperature": {
+        "source": "hwmon",
+        "chip": "auto",
+        "field": "temp1_input",
+        "scale": 0.001,
+        "default": 38,
+        "_note": "设备/主板温度（℃）"
+      },
+      "disk_manage": {
+        "source": "builder",
+        "name": "disk_manage",
+        "patterns": [
+          "sd[a-z]+",
+          "hd[a-z]+",
+          "vd[a-z]+",
+          "nvme[0-9]+n[0-9]+"
+        ],
+        "_doc": "★ 盘位数组。物理盘位排序：SATA(sd*/hd*/vd*) 在前，NVMe(nvme*n*) 在后（见 build_disk_manage / _disk_sort_key）"
+      }
+    },
+    "space_manage": {
+      "_doc": "★ 硬盘位页（普通 GET，非长连接）。客户端 getDiskListInfo 无条件把 u.code 置 0，所以 code 必须是 0。结构为嵌套 space_list[].disk_info[]，另兼容扁平 diskList。★ 盘位排序：SATA 在前、NVMe 在后。",
+      "source": "builder",
+      "name": "space_manage",
+      "patterns": [
+        "sd[a-z]+",
+        "hd[a-z]+",
+        "vd[a-z]+",
+        "nvme[0-9]+n[0-9]+"
+      ],
+      "mounts": null,
+      "_doc_mounts": "null=自动探测 /vol* 挂载点"
+    },
+    "get_space_list": {
+      "_doc": "存储空间列表（1.2/quota）。★ 客户端只接受 space_state ∈ {clean, degraded, syncing}，其它值（如 normal）会导致列表为空。",
+      "source": "builder",
+      "name": "space_list"
+    },
+    "get_eth_info_v2": {
+      "_doc": "★ 网卡列表。客户端 net-status 组件按位置取 e[0]/e[1] 作为「网口1/网口2」，用 connected 决定顶部「正常/未联网」、用 ip/ipv6 渲染 IP 行。字段必须齐全（eth_name/ip/ipv6/dns1/dns2/gw/mask/method/mac/connected）。★★ 返回空数组是致命错误：e[0]/e[1] 为 undefined 时 Object.assign 会跳过，导致顶部误显示「正常」但 IP 全为 \"--\"。★★★ 网卡名一律从 /sys/class/net 发现，不硬编码；也不用名字后缀判断物理/虚拟（飞牛OS 物理口就叫 enp2s0-ovs）。「哪张卡有意义」由客观事实决定：有默认路由 > 有 IPv4 > operstate 为 up。",
+      "source": "builder",
+      "name": "eth_list",
+      "max": 2,
+      "_doc_include": "强制纳入的接口名（跳过一切过滤）。仅在自动发现仍不对时用，例：[\"enp2s0-ovs\"]",
+      "include": [],
+      "_doc_relaxed": "true 时连内核标记的虚拟接口（bridge/bond/veth/tun）也纳入。排障用，不建议常开。",
+      "relaxed": false,
+      "_doc_exclude": "只放【确定】的虚拟接口。★ 绝不能把带 -ovs 后缀的名字放进来 —— 飞牛OS 的物理网卡就叫 enp2s0-ovs，排除它会导致网络页永久无数据（已踩过此坑）。",
+      "exclude": [
+        "lo",
+        "docker*",
+        "veth*",
+        "br-*",
+        "virbr*",
+        "tailscale*",
+        "tun*",
+        "tap*",
+        "wg*",
+        "zt*",
+        "dummy*",
+        "vmnet*",
+        "vnet*"
+      ]
+    },
+    "get_network_mode": {
+      "_doc": "★ 网络模式。客户端 deviceNetworkMode 读取的是 current_mode / mode_num（不是 mode！）。current_mode=0 → 独立模式；>0 → 聚合模式，具体文案由 mode_num 查表：1=主备双线 2=平衡XOR 4=动态链路聚合 6=自适应负载均衡。code=-2004 会让客户端隐藏该卡片。",
+      "code": {
+        "source": "static",
+        "value": 0
+      },
+      "current_mode": {
+        "source": "static",
+        "value": 0,
+        "_note": "0=独立模式（单网口，客户端只显示 eth1/eth2 两张卡）；>0=聚合模式"
+      },
+      "mode_num": {
+        "source": "static",
+        "value": 0,
+        "_note": "current_mode>0 时才被客户端查表使用"
+      }
+    },
+    "get_light_theme": {
+      "_doc": "★ 当前灯效（读）。客户端解析：status===0→关闭(999)；mode===0→随主题(1000)；否则 color_id+1000。本机氛围灯无硬件通道，故读【中间件持久化状态】（见 docs/led-control.md 3.2）",
+      "source": "builder",
+      "name": "led_state"
+    },
+    "get_atmo_light": {
+      "_doc": "★ 氛围灯状态（读）。返回 code/status/mode/color_id，与 get_light_theme 同源真值",
+      "source": "builder",
+      "name": "led_state"
+    },
+    "get_off_time": {
+      "_doc": "★ 自动息屏时长（读）。客户端取 res.xp_time（标量秒数），合法值 30/60/120/300",
+      "source": "builder",
+      "name": "off_time"
+    },
+    "get_update_version_desc": {
+      "_doc": "固件版本说明。无新版本时返回 code=-2099（客户端据此隐藏升级卡片）",
+      "source": "builder",
+      "name": "update_desc"
+    },
+    "get_event": {
+      "_doc": "★ 事件长连接（走 1.2/config stream，间隔 30s）。用于设备侧主动推送通知。",
+      "code": {
+        "source": "static",
+        "value": 0
+      }
+    },
+    "set_atmo_light": {
+      "_doc": "★ 设置氛围灯开关（写）。?light_mode={n}：0=关灯，9=开灯。写内部状态并返回 code=0",
+      "code": {
+        "source": "led_write"
+      },
+      "_write": "set_atmo_light"
+    },
+    "set_light_theme": {
+      "_doc": "★ 设置灯效模式（写）。?mode={n}：0=随主题，1=其他。写内部状态并返回 code=0",
+      "code": {
+        "source": "led_write"
+      },
+      "_write": "set_light_theme"
+    },
+    "set_atmo_color": {
+      "_doc": "★ 设置氛围灯颜色（写，POST JSON body）。body={color_id,r,g,b}。★客户端把1002蓝编码成(30,180,25)，原样透传。返回 code=0",
+      "code": {
+        "source": "led_write"
+      },
+      "_write": "set_atmo_color"
+    },
+    "set_off_time": {
+      "_doc": "★ 设置自动息屏时长（写）。?xp_time={n}（30/60/120/300秒）。写内部状态 + 到点熄屏。返回 code=0",
+      "code": {
+        "source": "off_time_write"
+      }
+    },
+    "set_power": {
+      "_doc": "★★ 关机 / 重启（写）。?power_mode={n}：0=关机（systemctl poweroff），1=重启（systemctl reboot）。★ 服务端延迟 1.5s 后异步执行，先回 code=0 再动作（否则回包前进程已死，客户端收不到响应）。客户端 getDevTurnOff 确认弹窗：关机 L()→ft(0)，重启 F()→ft(1)。",
+      "code": {
+        "source": "set_power"
+      }
+    },
+    "set_hardware": {
+      "_doc": "★★ 散热风扇档位（写）。?fan_mode={n}：5=智能（默认）/ 2=低速 / 3=标准 / 4=强劲（★ 取值不连续、无 1，与 UI FAN_LIST[].id 一致）。服务端规范化 → 落盘 FanState（/var/lib/hiksemi-sub/fan.json）→ 触发外部应用钩子。优先级：① HIKSEMI_FAN_APPLY_CMD 外部命令 ② HIKSEMI_FAN_COOLERCONTROL=1（内置 CoolerControl 适配器，把 4 档翻译成 /etc/coolercontrol 的 4 个 Mode，见 docs/coolercontrol.md）③ HIKSEMI_FAN_PWM_PATH sysfs PWM 节点 ④ 未配置则仅保存+回显。成功返回 code=0，否则客户端弹「设置失败」。回显靠设备状态帧 fanmode。",
+      "code": {
+        "source": "set_hardware"
+      }
+    }
+  },
+  "defaults": {
+    "_doc": "未配置的 action（含全部 set_* 写操作）统一返回",
+    "unknown_action": {
+      "code": 0
+    }
+  }
+}

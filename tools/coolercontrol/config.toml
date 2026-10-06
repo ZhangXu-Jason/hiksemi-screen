@@ -1,0 +1,266 @@
+# =============================================================================
+# CoolerControl 配置文件 —— 海康小彩屏（HS-AFS-R1）散热风扇 4 档落地
+# =============================================================================
+# 目标路径：/etc/coolercontrol/config.toml
+# 生成方式：本文件是【模板】，含占位符，必须先用 render-config.py 渲染：
+#
+#     ./render-config.py --host hs-afs-r1 --out-dir /etc/coolercontrol
+#
+# DEVICE_UID / CHANNEL 无法凭空生成，必须先在真机上探测：
+#     ./probe-coolercontrol.sh          # 自动探测并打印可用的 device-uid / channel
+# 或从 CoolerControl Web UI（http://<NAS>:11987 → System → 设备信息）复制。
+#
+# ── ★ 本机是【双风扇】───────────────────────────────────────────────────────
+#   本机 it8613 超级 I/O 暴露两路可控 PWM，各自跟随不同温度源：
+#
+#     通道     风扇       温度源                          对应 profile
+#     ------   --------   -----------------------------   ----------------
+#     pwm1     CPU 风扇   CPU 核心（Intel Core i3-N305）   hs-cpu-graph
+#     pwm2     机箱 风扇  核显 i915（机箱热源，转码时升温） hs-case-graph
+#
+#   ⇒ 两个通道【各自独立】按自己的曲线调速，互不影响。
+#
+# ── 与界面的对应关系 ────────────────────────────────────────────────────────
+#   界面档位    fan_mode   CoolerControl Mode   落地形态
+#   ---------   --------   ------------------   ------------------------------
+#   智能            5      hs-smart             pwm1→CPU 曲线 + pwm2→机箱曲线
+#   低速            2      hs-low               pwm1/pwm2 均 Fixed 25%
+#   标准            3      hs-standard          pwm1/pwm2 均 Fixed 55%
+#   强劲            4      hs-high              pwm1/pwm2 均 Fixed 100%
+#
+#   中间件通过 apply-mode.sh 切换 Mode（改 modes.json 的 current_active_mode
+#   并重启 daemon），本文件里的 [device-settings] 只作为「开机默认/兜底」。
+# =============================================================================
+
+# ── 设备名表（UID → 显示名）─────────────────────────────────────────────────
+# 由 daemon 自动维护，手工改动可能被覆盖；此处仅作可读性备注。
+[devices]
+# ★ 下面是本机（HS-AFS-R1，i3-N305）实测 device_uid → 设备名 的映射，可直接使用。
+#   若换机器，用 probe-coolercontrol.sh 重新探测后替换本段。
+#   关键设备（风扇四档落地只用到前三个）：
+#     71b063a3… = "it8613"                    ← 风扇 PWM 控制器（ITE 超级 I/O，双路 pwm1/pwm2）
+#     336d28e0… = "Intel(R) Core(TM) i3-N305" ← CPU 核心温度（pwm1/CPU 风扇曲线温度源）
+#     58cea05e… = "i915"                      ← 核显温度（pwm2/机箱风扇曲线温度源）
+71b063a3608e1f4f066afff5ba8ad37f92375b73d6005164d9e16752347f8742 = "it8613"
+f42333b13a2853dfb8e516c576470622e74a4659bfffe7ca229f68733beae979 = "acpitz"
+336d28e0c7580fdf9135eb62a4626ff7c3cbfdfef20a61d19fc92198f26bc7bd = "Intel(R) Core(TM) i3-N305"
+ae684419891f2b1bb1b35cb79a5ff237e1ba502337b23a2f085260b57453923c = "nvme"
+19e098e312e1b1b39163a343ea22b6ea17f18ec1a803ffe0ce44f5bacd6076ee = "Custom Sensors"
+404b863ceb9f28fdeaa807a09dbb723fc1b2d51a625f1d7ee55cbc20bc83b039 = "ST10000NM0016-1T"
+9a25088b56d5479dc4a88c902fe690d1d7e41d2771d4324dbb0bca37db242f05 = "ST10000NM0016-1T"
+b633490751da267be6aea2298b7ca70947e18c119ca63f93e8276328e47657d1 = "ST10000NM0016-1T"
+717a2319a1a7d621f71f2df77c30ad198a515af623c4d9e68032f28d61c3ee60 = "ST10000NM0016-1T"
+58cea05ead42a096567b4a1d62ed932c28b0a81abdf9ded743e0645afc0a4818 = "i915"
+a6970ad48d560dfa0d29a55851b0d404fb9215fef970dcc56eac74ac126c32b9 = "ST10000NM0016-1T"
+fe9dd1d133a7c3068c3b3d02633496671722cc835fdd6a4c2a9eac8f5bf48cbb = "ST10000NM0016-1T"
+d0c7c5c6d23b32eecf58d67ee9721f7992d8c4f117723becd5d750b6dbffb590 = "ST10000NM0016-1T"
+45b972cc5f8b6aecdc5d23220c82ab9e229a24e40a1d6d81a6587fb2bca5652f = "ST10000NM0016-1T"
+
+# ── legacy690 兼容段（★ 必须存在，可为空表）────────────────────────────────
+# daemon 启动时 check_readable() 的【第一个】调用 legacy690_ids() 会硬索引
+# ["legacy690"]（toml_edit：键不存在 → panic "index not found"）。
+# 官方默认配置里这是 Asetek 690LC 冷排的兼容开关表，普通设备留空即可。
+# ★★★ 教训：daemon 认定的完整段集 = devices / legacy690 / device-settings /
+#     profiles / functions / settings —— 缺 [legacy690] 直接启动崩溃。
+[legacy690]
+# ── ★ 设备通道默认设置（开机由 apply_on_boot 应用）─────────────────────────
+# ★ 关键契约：键 = 设备 UID；值必须是【内联表】（channel = { ... }），
+#   不能写成 [device-settings.xxx.pwm1] 子表，否则 daemon 读不到。
+# ★ 双通道写在【同一个内联表】里，用逗号分隔：
+#      "pwm1" = { profile_uid = "..." }, "pwm2" = { profile_uid = "..." }
+#   ⚠ 不能写成两个独立的 [device-settings.xxx] 段 —— TOML 会报重复表。
+# ★ speed_fixed 与 profile_uid 互斥：设置其一会自动清空另一个。
+#   优先级：SpeedFixed → Profile → Lighting → Lcd
+[device-settings."@DEVICE_UID@"]
+# 开机默认 = 智能档：pwm1 走 CPU 曲线，pwm2 走机箱(i915)曲线
+"@CPU_CHANNEL@"  = { profile_uid = "@CPU_SMART_PROFILE@" }
+"@CASE_CHANNEL@" = { profile_uid = "@CASE_SMART_PROFILE@" }
+
+# =============================================================================
+# Profiles —— 转速/曲线档位
+# =============================================================================
+# p_type 变体：Default / Fixed / Graph / Mix / Overlay
+#   uid "0" 是保留值（Unmanaged / Default），缺失时 daemon 自动补写。
+
+# 保留：Unmanaged（"跟随硬件/不接管"）
+[[profiles]]
+uid = "0"
+name = "Unmanaged"
+p_type = "Default"
+function_uid = "0"
+
+# ---- 低速 25%（fan_mode=2）------------------------------------------------
+[[profiles]]
+uid = "hs-low"
+name = "hs 低速 25%"
+p_type = "Fixed"
+function_uid = "0"
+speed_fixed = 25
+
+# ---- 标准 55%（fan_mode=3）------------------------------------------------
+[[profiles]]
+uid = "hs-standard"
+name = "hs 标准 55%"
+p_type = "Fixed"
+function_uid = "0"
+speed_fixed = 55
+
+# ---- 强劲 100%（fan_mode=4）-----------------------------------------------
+[[profiles]]
+uid = "hs-high"
+name = "hs 强劲 100%"
+p_type = "Fixed"
+function_uid = "0"
+speed_fixed = 100
+
+# ---- ★ 智能档 pwm1 · CPU 温度曲线（fan_mode=5）----------------------------
+# Graph profile：speed_profile = [[温度℃, 占空比%], ...]
+#   temp_source 必须是【内联表】{ temp_name, device_uid }
+#   temp_min / temp_max 必须是【浮点】（写成 30.0 而非 30）
+#   曲线点温度必须【单调递增】，占空比 0–100 整数，且首点温度必须 == temp_min
+#
+# ★ 曲线设计说明（CPU 风扇，源 = i3-N305 核心温度）：
+#   i3-N305 是 15W TDP 的 Alder Lake-N，满载也就在 80℃ 上下；
+#   采用「低载静音 / 高载拉满」的两段式：
+#     ≤45℃  22%   日常待机 / 轻载，风扇低速近乎无声
+#     ≤60℃  40%   中等负载，缓升
+#     ≤70℃  65%   持续负载（转码/备份），风噪可闻
+#     ≤80℃  88%   逼近 TJmax 前的重载
+#     ≥88℃ 100%   兜底拉满（N305 的 TJmax ≈ 105℃，留足余量）
+#   temp_min 取 30℃（低于此一律取首点占空比，不会被钳到 0 而停转）
+[[profiles]]
+uid = "hs-cpu-graph"
+name = "hs 智能 · CPU 曲线"
+p_type = "Graph"
+function_uid = "hs-fan-fn"
+temp_min = 30.0
+temp_max = 95.0
+temp_source = { temp_name = "@CPU_TEMP_NAME@", device_uid = "@CPU_TEMP_DEVICE_UID@" }
+speed_profile = [
+    [30.0,  22],   # ≤30℃  22%   低载静音底线
+    [45.0,  22],   # 45℃   22%   待机/轻载区间保持恒定，避免小幅抖动引起转速起伏
+    [60.0,  40],   # 60℃   40%
+    [70.0,  65],   # 70℃   65%
+    [80.0,  88],   # 80℃   88%
+    [88.0, 100],   # ≥88℃ 100%   兜底
+]
+
+# ---- ★ 智能档 pwm2 · 机箱温度曲线（fan_mode=5）----------------------------
+# ★ 温度源 = 核显 i915（用户指定的「机箱温度调节」曲线）。
+#   本机没有独立的机箱温度传感器；机箱内的主要热源是核显转码，
+#   因此用 i915 温度作为机箱风扇的代理温度源（与实际热负荷正相关）。
+# ★ 曲线设计说明（机箱风扇，源 = i915）：
+#   核显待机约 40℃、硬解/转码时约 55–65℃、AV1 多路转码可到 70℃+；
+#   机箱风扇服务的是大盘（6× ST10000NM0016 机械盘）与整体风道，
+#   所以「起调点比 CPU 曲线低、但上限不必打到 100%」：
+#     ≤42℃  0%    核显空闲 → 停转，彻底无声（机箱靠自然对流散热）
+#     ≤47℃  40%   核显轻载 → 起转，低档位送风
+#     ≤55℃  100%  核显重载/转码 → 满速排热（大盘对高温最敏感）
+#     ≥100℃ 100%  兜底
+#   ⚠ 首点占空比为 0 是【有意为之】：曲线整形函数 hs-fan-fn 的
+#     bypass_min_at_extremes = true 允许在曲线最左端不抬到 duty_minimum，
+#     从而在 i915 冷却时真正停转。若希望「永不停转」，
+#     把首点改成 [42.0, 15] 或把函数换成 hs-cpu-fn-alt（duty_minimum=10）。
+[[profiles]]
+uid = "hs-case-graph"
+name = "hs 智能 · 机箱曲线"
+p_type = "Graph"
+function_uid = "hs-fan-fn"
+temp_min = 0.0
+temp_max = 100.0
+temp_source = { temp_name = "@CASE_TEMP_NAME@", device_uid = "@CASE_TEMP_DEVICE_UID@" }
+speed_profile = [
+    [0.0,    0],   # ≤0℃     0%   理论下限（temp_min 之下取此点）
+    [42.0,   0],   # ≤42℃    0%   核显空闲 → 停转，彻底无声
+    [47.0,  40],   # 47℃    40%   起转送风
+    [55.0, 100],   # ≥55℃  100%   转码重载 → 满速排热
+    [100.0, 100],  # 兜底
+]
+
+# ---- 智能档兜底（探测不到温度源时使用）-----------------------------------
+[[profiles]]
+uid = "hs-smart-fallback"
+name = "hs 智能 · 兜底 35%"
+p_type = "Fixed"
+function_uid = "0"
+speed_fixed = 35
+
+# ---- 智能档兜底（仅缺机箱温度源、CPU 曲线仍可用时，pwm2 用此）-------------
+[[profiles]]
+uid = "hs-case-fallback"
+name = "hs 机箱 · 兜底 40%"
+p_type = "Fixed"
+function_uid = "0"
+speed_fixed = 40
+
+# =============================================================================
+# Functions —— 曲线整形（迟滞/步进/响应）
+# =============================================================================
+# f_type：Identity / Standard（ExponentialMovingAvg 已在 4.4.0 移除）
+# 键名一律【蛇形】：duty_minimum / duty_maximum / step_size_* / response_delay ...
+
+# 保留：Default Function（Identity，缺失时 daemon 自动补写）
+[[functions]]
+uid = "0"
+name = "Default Function"
+f_type = "Identity"
+duty_minimum = 1
+duty_maximum = 100
+response_delay = 1
+deviance = 2.0
+only_downward = false
+threshold_hopping = true
+bypass_min_at_extremes = false
+
+# ★ 两条智能曲线共用的整形函数（相当于 UI 新建的自定义函数）。
+#   作用：给曲线叠加「迟滞 + 步进限速」，避免温度在阈值附近抖动时转速来回跳。
+#   duty_minimum = 5：唯一用途是满足 daemon 的字段合法性下限；
+#     由于 bypass_min_at_extremes = true，温度低于曲线最左点时【不做抬底】，
+#     所以 pwm2（机箱曲线首点 = 0%）仍能真正停转。
+#   step_size_max_increasing/decreasing：单次调整幅度上限（%），
+#     response_delay = 2.0 s 表示每 2 秒最多走一次 ⇒ 转速变化平滑。
+[[functions]]
+uid = "hs-fan-fn"
+name = "hs 风扇曲线整形"
+f_type = "Standard"
+duty_minimum = 5
+duty_maximum = 100
+step_size_min_increasing = 1
+step_size_max_increasing = 8
+step_size_min_decreasing = 1
+step_size_max_decreasing = 5
+response_delay = 2
+deviance = 2.0
+only_downward = false
+threshold_hopping = true
+bypass_min_at_extremes = true
+
+# =============================================================================
+# 全局设置
+# =============================================================================
+[settings]
+# ★ 开机自动应用 [device-settings]（即上面的开机默认档）
+apply_on_boot = true
+
+# 不接管 liquidctl（本机风扇由 hwmon/EC 暴露，无 AIO 水冷）
+liquidctl_integration = false
+
+# 同一物理设备被多驱动重复枚举时合并显示
+hide_duplicate_devices = true
+
+# 启动延迟（秒）：等 hwmon 设备就绪
+startup_delay = 2
+
+# 监听端口（Web UI / API）
+port = 11987
+
+# 传感器自动探测
+sensors_auto_detect = true
+
+# 生产环境关闭 debug（排障时临时改 true）
+debug_logging = false
+
+# ── 电源档位联动（可选，留空即不启用）─────────────────────────────────────
+[power_profile_modes]
+# 形如：balanced = "hs-smart" / performance = "hs-high"
+# 由用户按需填写；不填则 4 档只通过 apply-mode.sh 手动切换。

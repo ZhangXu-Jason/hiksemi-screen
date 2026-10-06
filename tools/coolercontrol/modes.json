@@ -1,0 +1,106 @@
+{
+  "_comment": [
+    "=============================================================================",
+    "CoolerControl 模式快照 —— 海康小彩屏（HS-AFS-R1）散热风扇 4 档（双风扇）",
+    "=============================================================================",
+    "目标路径：/etc/coolercontrol/modes.json",
+    "生成方式：本文件是【模板】，含 @DEVICE_UID@ / @CPU_CHANNEL@ / @CASE_CHANNEL@ 占位符，",
+    "          必须先用 render-config.py 渲染后再写入目标路径：",
+    "            ./render-config.py --host hs-afs-r1 --out-dir /etc/coolercontrol",
+    "",
+    "★ 本机双风扇：it8613 的 pwm1 = CPU 风扇、pwm2 = 机箱风扇，",
+    "  每个 Mode 的 all_device_settings 都同时覆盖【两个通道】，",
+    "  否则未覆盖的通道会在 activate_mode() 时被 Reset（转速失控）。",
+    "",
+    "★ 激活语义（源码级已确认）：",
+    "  activate_mode(uid) 会把该 Mode 中每个 Setting 写回 config.toml 的",
+    "  [device-settings] 并立即应用到引擎；Mode 未覆盖的 channel 会被 Reset。",
+    "  ⇒ 因此改本文件的 current_active_mode 后【重启 daemon 即生效】。",
+    "  ⇒ apply-mode.sh 就是走这条路：改 current_active_mode + 重启容器。",
+    "",
+    "★ 字段契约：",
+    "  - all_device_settings 键 = 设备 UID，再下一层键 = channel 名",
+    "  - 每个 channel 的 Setting 是【平铺对象】：{ channel_name, profile_uid }",
+    "    或 { channel_name, speed_fixed }（两者互斥，本文件统一走 profile_uid）",
+    "  - 同一设备的多通道写在【同一个】设备对象内，键 = 各自的 channel 名",
+    "  - order 是 UI 展示顺序；current_active_mode 为 null 表示未激活任何 Mode",
+    "  - previous_active_mode 由 daemon 维护，用于「回滚到上一个」",
+    "",
+    "档位映射：fan_mode 5=智能→hs-smart / 2=低速→hs-low /",
+    "          3=标准→hs-standard / 4=强劲→hs-high"
+  ],
+  "modes": [
+    {
+      "uid": "hs-smart",
+      "name": "hs 智能（CPU 曲线 + 机箱曲线）",
+      "all_device_settings": {
+        "@DEVICE_UID@": {
+          "@CPU_CHANNEL@": {
+            "channel_name": "@CPU_CHANNEL@",
+            "profile_uid": "@CPU_SMART_PROFILE@"
+          },
+          "@CASE_CHANNEL@": {
+            "channel_name": "@CASE_CHANNEL@",
+            "profile_uid": "@CASE_SMART_PROFILE@"
+          }
+        }
+      }
+    },
+    {
+      "uid": "hs-low",
+      "name": "hs 低速 25%",
+      "all_device_settings": {
+        "@DEVICE_UID@": {
+          "@CPU_CHANNEL@": {
+            "channel_name": "@CPU_CHANNEL@",
+            "profile_uid": "hs-low"
+          },
+          "@CASE_CHANNEL@": {
+            "channel_name": "@CASE_CHANNEL@",
+            "profile_uid": "hs-low"
+          }
+        }
+      }
+    },
+    {
+      "uid": "hs-standard",
+      "name": "hs 标准 55%",
+      "all_device_settings": {
+        "@DEVICE_UID@": {
+          "@CPU_CHANNEL@": {
+            "channel_name": "@CPU_CHANNEL@",
+            "profile_uid": "hs-standard"
+          },
+          "@CASE_CHANNEL@": {
+            "channel_name": "@CASE_CHANNEL@",
+            "profile_uid": "hs-standard"
+          }
+        }
+      }
+    },
+    {
+      "uid": "hs-high",
+      "name": "hs 强劲 100%",
+      "all_device_settings": {
+        "@DEVICE_UID@": {
+          "@CPU_CHANNEL@": {
+            "channel_name": "@CPU_CHANNEL@",
+            "profile_uid": "hs-high"
+          },
+          "@CASE_CHANNEL@": {
+            "channel_name": "@CASE_CHANNEL@",
+            "profile_uid": "hs-high"
+          }
+        }
+      }
+    }
+  ],
+  "order": [
+    "hs-smart",
+    "hs-low",
+    "hs-standard",
+    "hs-high"
+  ],
+  "current_active_mode": "hs-smart",
+  "previous_active_mode": null
+}

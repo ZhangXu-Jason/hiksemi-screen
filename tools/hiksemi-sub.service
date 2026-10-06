@@ -1,0 +1,144 @@
+[Unit]
+Description=HIKSEMI Sub Kiosk Display (hiksemi-sub on fnOS)
+Documentation=file:@APP_DIR@/docs/deploy-guide.md
+# 等网络就绪即可；不需要 graphical.target（我们自己拉起 X）
+#
+# ★ 与 getty@tty1 的关系（两层防线，2026-10-05 两轮修正后的最终结论）：
+#   【第一层防线：getty@tty1 必须 mask（安装器已自动做，卸载时 unmask）】
+#     Debian/fnOS 的 tty1 getty 由 logind 在「VT1 激活且无属主」时**动态拉起**
+#     （autovt@tty1 → getty@tty1），它不在开机事务里 —— After 无从等待；
+#     而我们 xinit 激活 VT1 恰好就是触发条件 ⇒ getty 一起动就因 Conflicts
+#     反向停掉本服务（开机几秒 failed、手动 restart 正常）。mask 是唯一可靠解。
+#   【第二层：Conflicts 配 After 是 systemd.unit(5) 惯用法（配 Before 是反的）】
+#     Before 版会让「先启动的我们」被后启动的 getty 事务停掉；After 版至少
+#     保证若 getty 在开机事务中，由我们去停它。
+#
+# ★ 与飞牛自带监控服务（resmon_service / sysinfo_service）的开机竞争（教训 87）：
+#   它们开机时要「挂载设备接口」（GPU/DRM 等），而我们的 xinit 会 open
+#   /dev/dri/card0 并抢 DRM master。两者相撞时监控服务会【静默降级】——
+#   服务仍是 active，但 Web UI 的 CPU 占用 / 网络流量 / 存储读写【全部无数据】，
+#   必须手工 `systemctl restart resmon_service sysinfo_service` 才恢复
+#   （飞牛官方社区口径：日志报「资源监控未挂上设备接口」）。
+#   这里显式排到它们【之后】启动，把「抢设备」的时刻错开；再配合 [Service] 段的
+#   ExecStartPre=… --pre-delay 让路窗口，双保险。
+#   （After= 指向不存在的单元是无害的 —— 非飞牛系统上这两项自动失效。）
+After=network.target systemd-user-sessions.service getty@tty1.service resmon_service.service sysinfo_service.service
+Conflicts=getty@tty1.service
+# ★ 开机早期 VT/DRM 可能尚未就绪，允许在 multi-user 之后稍晚启动
+Wants=systemd-user-sessions.service
+
+# ★ 放宽启动限流（必须放 [Unit] 段）：systemd 默认 StartLimitBurst=5 /
+#   StartLimitIntervalSec=10s 太紧 —— 开机窗口期内 xinit 连续失败很容易撞满，
+#   之后会被 systemd 拉黑（表现：failed 且不再自动重启，必须手工 start）。
+#   这里 120s 内允许 40 次，足够覆盖开机早期的重试窗口。
+StartLimitIntervalSec=120
+StartLimitBurst=40
+
+[Service]
+Type=simple
+User=root
+
+# ── 关键：让 systemd 为进程建立 PAM 会话 ──
+# 作用：生成 /run/user/0 + 正确的 XAUTHORITY，解决
+#      「X 授权不足导致 Electron 连不上 X → SIGTRAP(133)」问题。
+#      有了它，就不必再手工 sudo 起程序。
+PAMName=login
+
+# ── 日志目录（kiosk.sh / 中间件 / X 的日志都写这里）──
+# 提前创建，避免首启时因目录不存在丢日志
+RuntimeDirectory=hiksemi-sub
+RuntimeDirectoryMode=0755
+ExecStartPre=/bin/mkdir -p /var/log/hiksemi-sub
+
+# ★ 开机让路（★ 与飞牛监控服务的竞争，见 [Unit] 段说明与 kiosk.sh §0.1）：
+#   在 xinit 抢核显【之前】，先给 fnOS 的 resmon/sysinfo 留出「挂设备接口」的
+#   时间窗。kiosk.sh --pre-delay 只在开机窗口内等待（HIKSEMI_BOOT_DELAY_SEC），
+#   手工 restart 时立即返回，不影响日常调试。
+#   前缀 `-` = 本步失败也继续 —— 它只是优化时序，不该阻断启动。
+ExecStartPre=-@KIOSK@ --pre-delay
+
+# ── 传给 kiosk.sh 的环境变量（由 install-autostart.sh 替换占位符）──
+#   HIKSEMI_DIR   = 程序目录（AppImage 解包/挂载目录或安装目录）
+#   HIKSEMI_TOOLS = 工具目录（默认 /screen/tools，持久目录）
+# 这两个变量会覆盖 kiosk.sh 的自动探测逻辑，保证路径唯一确定。
+Environment=HIKSEMI_DIR=@APP_DIR@ HIKSEMI_TOOLS=@TOOLS_DIR@
+
+# ── ★ 开机 X 就绪等待上限（秒）──
+# kiosk.sh 会在启动前等 X(:0) 可连接，最多这么久。
+# 开机早期 VT/DRM 未就绪时，这能把「必失败一次」变成「一次成功」。
+# 设 0 关闭等待（排障用）。默认 15。
+Environment=HIKSEMI_X_WAIT_SEC=15
+
+# ── ★ 开机让路 / 监控兜底参数（详见 kiosk.sh §0.1 与 §4.9）──
+#   背景：fnOS 的 resmon_service / sysinfo_service 开机要「挂载设备接口」，
+#   而我们的 X 会抢核显 —— 相撞时它们静默降级（Web UI 监控全空）。
+#   HIKSEMI_BOOT_DELAY_SEC  = 开机窗口内、拉起 X 前额外等待秒数（0 = 不等）
+#   HIKSEMI_BOOT_WINDOW_SEC = 什么算「开机窗口」：uptime 小于该值才算（秒）
+#   HIKSEMI_MONITOR_RESYNC  = auto/1 = 开机后自动补挂监控服务；0 = 关闭
+#
+#   ★ 2026-10-06：补挂已从「后台延迟 60s」改为「启动程序前【同步】执行一次
+#     （restart，非 try-restart）」。原因：后台子进程会随主进程退出被 cgroup
+#     一起杀掉（默认 KillMode=control-group），开机早期 kiosk 常被重拉 ⇒ 旧兜底
+#     永远跑不到。同步执行与主进程存活解耦，才真正等价于用户手工那条命令。
+#   HIKSEMI_MONITOR_RESYNC_GRACE = 同步补挂前先等的秒数（默认 3，让 X 稳持有 master）
+#   HIKSEMI_MONITOR_RESYNC_LATE  = 进程存活时再延迟补挂的秒数（默认 150；仅附加保险）
+Environment=HIKSEMI_BOOT_DELAY_SEC=8
+Environment=HIKSEMI_BOOT_WINDOW_SEC=300
+Environment=HIKSEMI_MONITOR_RESYNC=auto
+Environment=HIKSEMI_MONITOR_RESYNC_GRACE=3
+Environment=HIKSEMI_MONITOR_RESYNC_LATE=150
+
+# ── 中间件日志级别（★ 控制日志量）──
+#   quiet  = 只留启动/错误/写入操作（日志最少）
+#   normal = 上面 + 只读轮询首次与每 100 次摘要（默认，比旧版降 90%+）
+#   debug  = 每个请求/响应完整流水（排障用，日志多）
+# 需要排障时改成 debug 后 systemctl restart 即可。
+Environment=HIKSEMI_LOG=normal
+
+# ── 散热风扇落地通道（可选，由 install-autostart.sh 按需注入）──
+# 界面四档（智能5/低速2/标准3/强劲4）默认只保存+回显，不驱动硬件。
+# 想真正调速，三选一（优先级从高到低）：
+#   ① 外部命令：
+#        Environment=HIKSEMI_FAN_APPLY_CMD=/usr/local/bin/pwm-set {mode}
+#   ② 内置 CoolerControl 适配器（推荐；安装器 --fan-coolercontrol on 会自动写入）：
+#        Environment=HIKSEMI_FAN_COOLERCONTROL=1 HIKSEMI_FAN_COOLERCONTROL_SCRIPT=/screen/tools/coolercontrol/apply-mode.sh
+#   ③ 直接写 sysfs PWM（低速64/标准140/强劲255；智能档不写）：
+#        Environment=HIKSEMI_FAN_PWM_PATH=/sys/class/hwmon/hwmon3/pwm1
+# 详见 docs/coolercontrol.md 与 docs/fan-control.md §5。
+#Environment=HIKSEMI_FAN_COOLERCONTROL=1
+
+# ── 启动方式：xinit 一把拉起「X(:0) + kiosk.sh」──
+# 注意：绝不能用 ExecStartPre=startx（阻塞式，服务永远起不来）
+# 其中 @KIOSK@ 由 install-autostart.sh 按实际路径替换（= TOOLS_DIR/kiosk.sh）。
+# @APP_DIR@ 也会被替换，仅供 Documentation 引用。
+# X 日志重定向到统一日志目录
+ExecStart=/usr/bin/xinit @KIOSK@ -- :0 vt1 -nolisten tcp -logfile /var/log/hiksemi-sub/xorg.log
+
+# ── 崩溃自动重启 ──
+# ★ 注意：systemd 对「显式 stop」（如 Conflicts 触发、手工 stop）永不 Restart；
+#   开机被停的根因已在 [Unit] 段用 After=getty@tty1 修正，这里只是崩溃兜底。
+Restart=always
+RestartSec=3
+
+# 注：启动限流参数（StartLimitIntervalSec / StartLimitBurst）已在 [Unit] 段设置
+#     —— 这两个参数只认 [Unit] 段，放 [Service] 会被 systemd 忽略并告警。
+
+# ── 日志 ──
+# systemd 侧日志走 journal（journalctl -u hiksemi-sub 查看）；
+# 应用侧日志（kiosk/中间件/X）由 kiosk.sh 写入 /var/log/hiksemi-sub/
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hiksemi-sub
+
+# ── 独占 tty1，避免和登录终端抢屏 ──
+StandardInput=tty-fail
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+# ── 权限：允许访问显卡 / 输入设备（root 下其实已足够，显式声明更稳）──
+SupplementaryGroups=video render input audio
+
+[Install]
+WantedBy=multi-user.target
