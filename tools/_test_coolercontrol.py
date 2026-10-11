@@ -523,6 +523,16 @@ fan4 = { disabled = true }
            p.returncode == 0 and "智能" in (p.stdout + p.stderr),
            (p.stdout + p.stderr)[-300:])
 
+    # 「屏幕 ↔ CC 不同步」四环诊断（sync 子命令）
+    ok("probe 支持 sync 子命令", '"sync"' in ptxt or "'sync'" in ptxt)
+    ok("sync ① 先查工具是不是新版", "工具版本" in ptxt)
+    ok("sync ② 查档位绑定", "档位 → Mode 绑定" in ptxt)
+    ok("sync ③ 查反向档位", "反向档位" in ptxt)
+    ok("sync ④ 查重启通道（改完要有人重启 daemon）", "重启通道" in ptxt)
+    ok("sync ⑤ 查中间件是否已重启（新代码跑了没）", "中间件是否已重启" in ptxt)
+    ok("sync 提示 install-autostart.sh 用 cp -rn 不覆盖",
+       "不覆盖" in ptxt or "cp -f" in ptxt)
+
 finally:
     shutil.rmtree(TMPROOT, ignore_errors=True)
 

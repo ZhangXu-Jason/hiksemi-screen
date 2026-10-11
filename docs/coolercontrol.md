@@ -405,9 +405,42 @@ sudo /screen/tools/coolercontrol/apply-mode.sh --status
 | CC 切了但屏幕没变 | `apply-mode.sh --current` 能否识别；识别不出就是名字无关，需 `--bind` |
 | 切过去完全不生效 | `--scan` 里有没有 `@DEVICE_UID@` 非法键（模板占位符残留）⇒ 重新渲染 |
 | 都不行 | `probe-coolercontrol.sh modes`（UID/通道/profile 三方对比） |
+| **一次性全查** | ★ `probe-coolercontrol.sh sync`：① 工具是否新版 ② 档位绑定 ③ 反向档位 ④ 重启通道是否存在 ⑤ **中间件改完有没有重启** |
 
 > ★ 每次切档都要**重启 daemon**（`systemctl restart coolercontrold`），
 > 这是 6.x 之前的既定路径（Mode 是启动时读 `current_active_mode` 激活的）。
+>
+> ★★ **改了工具脚本不会自动到真机上**：`install-autostart.sh` 用 `cp -rn`
+> （不覆盖已存在文件），所以 `fan-mode-map.py` 之类的新文件必须手工拷过去：
+> `sudo cp -f tools/coolercontrol/* /screen/tools/coolercontrol/`。
+> 同理，**改了 `middleware.py` 必须 `sudo systemctl restart hiksemi-sub`**，
+> 否则反向同步这类新代码根本没在跑。
+
+### 6.6 真机教训：手工拼出来的 `modes.json` 是坏的（`@XXX@` 占位符残留）
+
+用户在 Web UI 里自建 Mode 时，容易把**模板原文**贴进去。实测某份真机
+`modes.json` 里 4 个 Mode **全部**含非法设备键，且只有「智能」那一个的通道是真的：
+
+```
+1a700658…  hs 智能（CPU 曲线 + 机箱曲线）   fan3→hs-cpu-graph, fan2→hs-case-graph, @DEVICE_UID@→…
+57070995…  hs 低速 25%                      @CPU_CHANNEL@→@CPU_SMART_PROFILE@, @CASE_CHANNEL@→…
+c89036e4…  hs 标准 55%                      @CPU_CHANNEL@→…（同上，全是占位符）
+52c9453f…  hs 强劲 100%                     @CPU_CHANNEL@→…（同上，全是占位符）
+```
+
+后果：daemon 认不出 `@DEVICE_UID@` 这种键 ⇒ **切过去也不生效**，
+且症状与「UID 漂移 / 通道名错 / 绑定失效」完全一样。
+
+**判别**：`apply-mode.sh --scan`（或 `probe-coolercontrol.sh modes`）会直接列出
+「发现 N 处非法设备键」。**不要用 `--clean` 之类删键了事** —— 删完那几个 Mode 就是空的，
+仍然不生效。**正确做法是重新渲染**（内容才是对的）。
+
+两种渲染产物，按需选一：
+
+| 方案 | 产物 | 代价 |
+| --- | --- | --- |
+| **A. 标准版** | Mode uid = `hs-smart/low/standard/high` | UI 里自建的那 4 个 UUID 模式会被替换 |
+| **B. 保留 UUID 版** | uid/名字沿用你自建的，内容换成正确的 `fan3/fan2` + profile；映射文件指向这些 UUID | UI 里的模式不丢，屏幕直接命中它们 |
 
 ## 7. 为什么用「改文件 + 重启」而不是调 REST API
 

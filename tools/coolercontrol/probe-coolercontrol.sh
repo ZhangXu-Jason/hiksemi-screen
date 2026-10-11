@@ -9,6 +9,8 @@
 #     ./probe-coolercontrol.sh --short         # 只打印可直接复制的一行命令
 #     sudo ./probe-coolercontrol.sh modes      # ★ 诊断「Mode 在 UI 里内容为空」
 #         （比对 daemon 真值设备表 / modes.json 引用的 UID / 通道 / profile）
+#     sudo ./probe-coolercontrol.sh sync       # ★★ 诊断「屏幕 ↔ CoolerControl 不同步」
+#         （工具版本 / 档位绑定 / 反向档位 / 重启通道 / 中间件是否已重启）
 #     CC_DIR=/path ./probe-coolercontrol.sh modes   # 配置目录不在 /etc/coolercontrol 时
 # =============================================================================
 set +e
@@ -20,6 +22,124 @@ SEC() { printf '\n\033[1;36m【%s】\033[0m\n' "$*"; }
 OK()  { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 NG()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
 INFO(){ printf '  · %s\n' "$*"; }
+
+# ── 0.0 sync 分支：★ 「屏幕 ↔ CoolerControl 不同步」一次性取证 ─────────────
+#   症状：屏幕切档 CC 没反应 / 在 CC UI 里切模式屏幕不跟 / 新建模式后失联。
+#   链条有四环，任一环断都会表现成"不同步"，逐环查：
+#     ① 工具是不是新版（旧脚本 = 修了也没用）
+#     ② 档位能不能解析出 Mode（绑定）
+#     ③ 改完配置有没有人去重启 daemon（重启通道存在吗）
+#     ④ 中间件有没有重启（反向同步是新代码，跑着旧进程就不会生效）
+if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
+    CC_DIR="${CC_DIR:-/etc/coolercontrol}"
+    HERE="$(cd "$(dirname "$0")" && pwd)"
+    PYBIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null)"
+    export CC_MODE_CONFIG="$CC_DIR/modes.json"
+    export CC_FAN_MODE_MAP="$CC_DIR/hs-fan-mode-map.json"
+
+    SEC "① 工具版本（旧脚本 = 一切白搭）"
+    MISS=0
+    for f in fan-mode-map.py render-config.py apply-mode.sh; do
+        if [ -f "$HERE/$f" ]; then OK "$f"; else NG "缺少 $HERE/$f"; MISS=1; fi
+    done
+    if grep -q -- "--scan" "$HERE/apply-mode.sh" 2>/dev/null; then
+        OK "apply-mode.sh 是新版（支持 --scan）"
+    else
+        NG "apply-mode.sh 是【旧版】（无 --scan）⇒ 档位绑定修复根本没到位"
+        MISS=1
+    fi
+    if grep -q "fan-mode-map.py" "$HERE/apply-mode.sh" 2>/dev/null; then
+        OK "apply-mode.sh 走映射解析（不再写死 uid）"
+    else
+        NG "apply-mode.sh 仍在写死 uid"
+        MISS=1
+    fi
+    if [ "$MISS" = "1" ]; then
+        INFO "修复：sudo cp -f <本地>/tools/coolercontrol/* $HERE/"
+        INFO "      sudo chmod +x $HERE/*.sh $HERE/*.py"
+    fi
+
+    SEC "② 档位 → Mode 绑定"
+    [ -f "$CC_DIR/modes.json" ] && OK "modes.json: $CC_DIR/modes.json" \
+        || NG "找不到 $CC_DIR/modes.json"
+    [ -f "$CC_FAN_MODE_MAP" ] && OK "映射文件: $CC_FAN_MODE_MAP" \
+        || INFO "无映射文件（走自动认领）—— 渲染时会自动生成"
+    if [ -n "$PYBIN" ] && [ -f "$HERE/fan-mode-map.py" ]; then
+        "$PYBIN" "$HERE/fan-mode-map.py" --scan 2>&1 | sed 's/^/  /'
+    fi
+
+    SEC "③ 当前激活 & 反向档位"
+    if [ -n "$PYBIN" ] && [ -f "$HERE/fan-mode-map.py" ]; then
+        CUR="$("$PYBIN" "$HERE/fan-mode-map.py" --reverse 2>/dev/null)"
+        if [ -n "$CUR" ]; then
+            OK "当前激活的 Mode 对应屏幕档位 = $CUR"
+        else
+            NG "当前激活的 Mode 识别不出档位 ⇒ 屏幕回显不会跟"
+            INFO "修：sudo $HERE/apply-mode.sh --bind 5=<uid 或 Mode 名字>"
+        fi
+    fi
+
+    SEC "④ 重启通道（改完配置要有人重启 daemon 才生效）"
+    FOUND=0
+    if command -v systemctl >/dev/null 2>&1; then
+        for s in coolercontrold coolercontrol; do
+            if systemctl list-unit-files 2>/dev/null | grep -q "^${s}\.service"; then
+                OK "systemd 服务: ${s} ($(systemctl is-active "$s" 2>/dev/null))"
+                INFO "重启命令: sudo systemctl restart ${s}"
+                FOUND=1
+            fi
+        done
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        DOCK="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i coolercontrol)"
+        if [ -n "$DOCK" ]; then
+            OK "docker 容器: $DOCK"
+            INFO "重启命令: sudo docker restart $DOCK"
+            FOUND=1
+        fi
+    fi
+    [ "$FOUND" = "1" ] || NG "既没找到 systemd 服务也没找到 docker 容器
+      ⇒ apply-mode.sh 只能写文件、重启不了 ⇒ 切档【不会生效】
+      ⇒ 用 HIKSEMI_FAN_APPLY_CMD 指定你自己的重启命令"
+
+    SEC "⑤ 中间件是否已重启（★ 反向同步是新代码，跑旧进程就不生效）"
+    SVC=/etc/systemd/system/hiksemi-sub.service
+    if [ ! -f "$SVC" ]; then
+        INFO "没找到 $SVC（中间件不是 systemd 起的？跳过）"
+    else
+        if grep -q '^Environment=HIKSEMI_FAN_COOLERCONTROL=1' "$SVC"; then
+            OK "已注入 HIKSEMI_FAN_COOLERCONTROL=1"
+        else
+            NG "service 里没有生效的 HIKSEMI_FAN_COOLERCONTROL=1 ⇒ 屏幕与 CC 不会联动"
+            INFO "修：sudo bash $(dirname "$HERE")/install-autostart.sh --fan-coolercontrol on"
+        fi
+        command -v systemctl >/dev/null 2>&1 &&
+            INFO "hiksemi-sub: $(systemctl is-active hiksemi-sub 2>/dev/null)"
+        ST="$(systemctl show -p ExecMainStartTimestamp hiksemi-sub 2>/dev/null | cut -d= -f2-)"
+        MW="$(dirname "$HERE")/middleware/middleware.py"
+        if [ -n "$ST" ] && [ -f "$MW" ]; then
+            E1="$(date -d "$ST" +%s 2>/dev/null)"
+            E2="$(stat -c %Y "$MW" 2>/dev/null)"
+            INFO "中间件启动于: $ST"
+            INFO "middleware.py 修改于: $(date -r "$MW" '+%F %T' 2>/dev/null)"
+            if [ -n "$E1" ] && [ -n "$E2" ] && [ "$E1" -lt "$E2" ]; then
+                NG "★ 中间件进程比 middleware.py 旧 ⇒ 改动【没生效】"
+                INFO "修：sudo systemctl restart hiksemi-sub"
+            else
+                OK "中间件比 middleware.py 新（改动已在跑）"
+            fi
+        fi
+    fi
+
+    echo
+    INFO "把上面整段输出贴给排障方即可定位。常见结论："
+    INFO "  · ① 有 NG        → 脚本没同步到真机（install-autostart.sh 用 cp -rn 不覆盖）"
+    INFO "  · ② 有『未匹配』 → 名字不含档位关键词，需 --bind"
+    INFO "  · ③ 有 NG        → 反向档位识别不出，需 --bind"
+    INFO "  · ④ 有 NG        → 重启通道缺失，切档只写文件不生效"
+    INFO "  · ⑤ 有 NG        → 改了中间件没重启"
+    exit 0
+fi
 
 # ── 0. modes 诊断分支（放在最前，跑完即退出）───────────────────────────────
 # 症状：CoolerControl Web UI 打开某个 Mode，「设备 / 通道 / 设置」一片空白。

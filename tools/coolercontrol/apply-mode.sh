@@ -205,13 +205,20 @@ for a in "$@"; do
     esac
 done
 
-[ -n "$MODE_ARG" ] || { cmd_list; die "缺少档位参数（5/2/3/4）"; }
-mode_name_for "$MODE_ARG" >/dev/null 2>&1 || true
+if [ -z "$MODE_ARG" ] && [ "${#BIND_ARGS[@]}" -eq 0 ]; then
+    cmd_list
+    die "缺少档位参数（5/2/3/4）"
+fi
 
 # 允许顺手绑定：apply-mode.sh 5=<uid或Mode名>  （等价于先 --bind 再切档）
 if [ "${#BIND_ARGS[@]}" -gt 0 ]; then
     [ -f "$MAP_PY" ] || die "绑定需要 $MAP_PY，但没找到"
     python3 "$MAP_PY" --bind "${BIND_ARGS[@]}" || die "绑定失败"
+    # 只绑定、不切档时到此为止（不给"缺少档位参数"的假报错）
+    if [ -z "$MODE_ARG" ]; then
+        log "已更新绑定，未切档。复查：$(basename "$0") --scan"
+        exit 0
+    fi
 fi
 
 MODE_UID="$(resolve_uid_for "$MODE_ARG")" || die "非法档位 '$MODE_ARG'（只接受 5/2/3/4）"
