@@ -95,7 +95,7 @@ CoolerControl daemon 启动
 | `modes.json` | **模板**：4 个 Mode 快照（均**双通道**）+ `order` + `current_active_mode` | 是 |
 | `render-config.py` | 渲染占位符 + 契约自校验（TOML/JSON）+ 原子写 + 自动备份；支持双风扇/单风扇/降级 | — |
 | `apply-mode.sh` | **中间件实际调用的入口**：`apply-mode.sh {5\|2\|3\|4}` | — |
-| `probe-coolercontrol.sh` | 只读探测真机：安装形态 / 端口 / 真实 uid / **双路 pwm 通道** / CPU 与机箱温度源 | — |
+| `probe-coolercontrol.sh` | 只读探测真机：安装形态 / 端口 / 真实 uid / **双路 pwm 通道** / CPU 与机箱温度源；`modes` 子命令 = 诊断「Mode 在 UI 里空白」（见 §6.4） | — |
 
 > **为什么用「模板 + 渲染」而不是直接写死**：
 > `device_uid` 是 CoolerControl 依据设备 sysfs 属性算出的 **64 位 sha256**，
@@ -209,6 +209,7 @@ sudo systemctl daemon-reload && sudo systemctl restart hiksemi-sub
 | 8 | `activate_mode()` 的副作用 | 会把 Mode 的 Setting **写回** `config.toml`，并对 **Mode 未覆盖的 channel 做 Reset** |
 | 9 | `apply_on_boot = true` | daemon 启动时重新应用 `[device-settings]` 已存设置 |
 | 10 | ★★ **`[legacy690]` 段必须存在（可为空表）** | daemon 启动 `check_readable()` 第一个调用 `legacy690_ids()` 就**硬索引** `["legacy690"]`——toml_edit 对不存在的键直接 panic `index not found`（真机实测：`config.rs:480` 启动即崩）。官方默认配置含此空表（Asetek 690LC 兼容开关），普通设备留空即可。**daemon 认定完整段集 = devices / legacy690 / device-settings / profiles / functions / settings**，模板与渲染校验均已锁定 |
+| 11 | ★★ **device UID 会漂移** | UID 是 daemon 按设备属性算的 sha256，**daemon 升级 / 内核 hwmon 变化都会让它变**。漂移后 `modes.json` 的 `all_device_settings` 键对不上任何已知设备 ⇒ Web UI 打开 Mode 时「设备/通道/设置」**一片空白**（JSON 语法完全正确，最容易误判成模板错）；`[device-settings]` 同样失效 ⇒ 风扇不受控。daemon 每次启动都会用真值重写 `config.toml` 的 `[devices]` 段 ⇒ 那是唯一权威来源，用 `render-config.py --auto-uid` 按设备名重新对齐即可（详见 6.4） |
 
 ### 6.1 反序列化方式（为什么键是蛇形）
 
@@ -255,6 +256,64 @@ daemon **不使用** `serde` derive 直接反序列化 `config.toml`，
 `Setting` 是**平铺对象**（`#[serde(untagged)] SettingKind` + `flatten`），
 即 `{ channel_name, profile_uid }` 或 `{ channel_name, speed_fixed }`
 直接同级，**没有嵌套的 kind 包装**。
+
+### 6.4 ★ Mode 在 UI 里「设备 / 通道 / 设置」一片空白
+
+**症状**：Mode 列表能看到（hs-smart / hs-low / hs-standard / hs-high），
+点进去却看不到任何设备、通道和设置项。
+
+**先给结论：不是模板结构问题。** 渲染产物完全符合 daemon 契约 ——
+
+```
+Mode { uid, name, all_device_settings: { <device_uid>: { <channel>: Setting } } }
+Setting = { channel_name, profile_uid }        # 与 modes.rs / api/modes.rs 一致
+```
+
+空白只有一种解释：**`all_device_settings` 的键不是 daemon 当前认识的设备**
+（UI 用设备表做 join，对不上就直接不显示）。也就是 device UID 漂移。
+
+一步诊断（只读，不改任何文件）：
+
+```bash
+sudo /screen/tools/coolercontrol/probe-coolercontrol.sh modes
+# 配置目录不在 /etc/coolercontrol 时：
+#   sudo CC_DIR=/path/to/dir /screen/tools/coolercontrol/probe-coolercontrol.sh modes
+```
+
+它把 **daemon 真值设备表**（`config.toml` 的 `[devices]` 段）与
+`modes.json` 引用的 UID / 通道 / profile 三方对比，直接告诉你属于哪一种：
+
+| 诊断结论 | 含义 | 处置 |
+| --- | --- | --- |
+| UID 与真值对不上 | **UID 漂移**（最常见） | 按提示跑 `--auto-uid` |
+| 设备键不是 64 位 hex | `modes.json` **没渲染过**（还是 `@DEVICE_UID@`） | 先渲染再重启 daemon |
+| 引用了不存在的 profile | `config.toml` 与 `modes.json` 版本不匹配 | 重新渲染两份（render 是一起写的） |
+| 全部命中 | 内容层面没问题 | 查 docker 挂载路径 / 有没有重启 daemon / UI 硬刷新（Ctrl+F5，前端会缓存设备表） |
+
+修一条命令：
+
+```bash
+sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 --auto-uid
+sudo systemctl restart coolercontrold          # 或 docker restart coolercontrol
+sudo /screen/tools/coolercontrol/probe-coolercontrol.sh modes   # 复查应全绿
+```
+
+**`--auto-uid` 做了什么**：读 `/etc/coolercontrol/config.toml` 的 `[devices]` 段
+（daemon 每次启动用真值重写 = 唯一权威来源），按**设备名**反查 UID：
+
+| 槽位 | 设备名 | 影响 |
+| --- | --- | --- |
+| `device_uid` | `it8613` | modes.json 的键 + `[device-settings]` |
+| CPU 温度 | `Intel(R) Core(TM) i3-N305` | `hs-cpu-graph` 的 `temp_source.device_uid` |
+| 机箱温度 | `i915` | `hs-case-graph` 的 `temp_source.device_uid` |
+
+三个槽位同时对齐，`[devices]` 段也会同步改写（否则产物内部自相矛盾：
+`[devices]` 是旧 UID、`[device-settings]` 是新 UID，排查脚本会再次误报）。
+**风扇设备找不到会直接报错退出**（绝不用旧值蒙混）；
+温度源找不到只告警，该路智能档退化成 Fixed 兜底。
+
+> 换机器/设备名不同：`--fan-device-name` / `--cpu-temp-device-name` /
+> `--case-temp-device-name` 指定 `[devices]` 段里的显示名即可。
 
 ## 7. 为什么用「改文件 + 重启」而不是调 REST API
 

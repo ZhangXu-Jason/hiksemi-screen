@@ -7,6 +7,9 @@
 # 用法：
 #     sudo ./probe-coolercontrol.sh            # 完整探测
 #     ./probe-coolercontrol.sh --short         # 只打印可直接复制的一行命令
+#     sudo ./probe-coolercontrol.sh modes      # ★ 诊断「Mode 在 UI 里内容为空」
+#         （比对 daemon 真值设备表 / modes.json 引用的 UID / 通道 / profile）
+#     CC_DIR=/path ./probe-coolercontrol.sh modes   # 配置目录不在 /etc/coolercontrol 时
 # =============================================================================
 set +e
 
@@ -17,6 +20,148 @@ SEC() { printf '\n\033[1;36m【%s】\033[0m\n' "$*"; }
 OK()  { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 NG()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
 INFO(){ printf '  · %s\n' "$*"; }
+
+# ── 0. modes 诊断分支（放在最前，跑完即退出）───────────────────────────────
+# 症状：CoolerControl Web UI 打开某个 Mode，「设备 / 通道 / 设置」一片空白。
+# 99% 不是模板结构问题（我们的 modes.json 完全符合 daemon 契约），而是
+# modes.json 里的 device UID 与 daemon 当前认定的设备对不上（UID 漂移）。
+if [ "${1:-}" = "modes" ] || [ "${1:-}" = "--modes" ]; then
+    CC_DIR="${CC_DIR:-/etc/coolercontrol}"
+    SEC "0. CoolerControl 运行形态"
+    if command -v systemctl >/dev/null 2>&1; then
+        for s in coolercontrold coolercontrol; do
+            systemctl list-unit-files 2>/dev/null | grep -q "^${s}\.service" &&
+                INFO "$s: $(systemctl is-active "$s" 2>/dev/null)"
+        done
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null |
+            grep -i coolercontrol | sed 's/^/  容器: /'
+    fi
+    [ -d "$CC_DIR" ] && OK "配置目录: $CC_DIR" || NG "配置目录不存在: $CC_DIR"
+    for f in config.toml modes.json; do
+        if [ -f "$CC_DIR/$f" ]; then
+            INFO "$f  mtime=$(date -r "$CC_DIR/$f" '+%F %T' 2>/dev/null)  size=$(wc -c < "$CC_DIR/$f")"
+        else
+            NG "缺少 $CC_DIR/$f"
+        fi
+    done
+
+    PYBIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null)"
+    [ -n "$PYBIN" ] || { NG "找不到 python3/python，无法诊断"; exit 1; }
+    "$PYBIN" - "$CC_DIR" <<'PY'
+import json, os, re, sys
+
+cc = sys.argv[1]
+cfg_p = os.path.join(cc, "config.toml")
+mod_p = os.path.join(cc, "modes.json")
+
+def sec(t): print(f"\n\033[1;36m【{t}】\033[0m")
+def ok(s):  print(f"  \033[32m✓\033[0m {s}")
+def ng(s):  print(f"  \033[31m✗\033[0m {s}")
+def info(s):print(f"  · {s}")
+
+# ---- 读 config.toml：[devices] / [[profiles]] / [device-settings] ----
+text = ""
+if os.path.isfile(cfg_p):
+    with open(cfg_p, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+else:
+    ng(f"无 {cfg_p}")
+
+devices, profiles, ds = {}, [], {}
+if text:
+    m = re.search(r"^\[devices\][ \t]*$(.*?)(?=^[ \t]*\[)", text, flags=re.M | re.S)
+    if m:
+        for line in m.group(1).splitlines():
+            mm = re.match(r'^"?([0-9a-fA-F]{64})"?[ \t]*=[ \t]*"(.*)"[ \t]*$', line.strip())
+            if mm: devices[mm.group(1)] = mm.group(2)
+    # [[profiles]] 块内的 uid
+    blocks = re.split(r"^\[\[profiles\]\][ \t]*$", text, flags=re.M)[1:]
+    for b in blocks:
+        u = re.search(r'^uid[ \t]*=[ \t]*"([^"]+)"', b, flags=re.M)
+        if u: profiles.append(u.group(1))
+    # [device-settings."uid"] 段内的通道
+    for sm in re.finditer(r'^\[device-settings\.[ \t]*"?([0-9a-fA-F]{64})"?\][ \t]*$(.*?)(?=^[ \t]*\[)',
+                          text, flags=re.M | re.S):
+        chans = re.findall(r'^"?([A-Za-z0-9_]+)"?[ \t]*=[ \t]*\{', sm.group(2), flags=re.M)
+        ds[sm.group(1)] = chans
+
+sec("1. daemon 真值设备表（config.toml [devices]，daemon 每次启动重写 = 权威）")
+if not devices:
+    ng("读不到 [devices] 段 —— daemon 可能从未成功启动过")
+else:
+    for u, n in devices.items():
+        mark = ""
+        if u in ds: mark = f"   ← 已配置通道 {ds[u]}"
+        print(f"  {u[:12]}…  {n}{mark}")
+
+sec("2. config.toml 里的 profiles")
+info("profiles: " + (", ".join(profiles) if profiles else "（无）"))
+for u, chans in ds.items():
+    info(f"device-settings {u[:12]}… → {chans or '（空）'}"
+         + ("  ✓" if u in devices else "  ✗ 该 UID 不在 [devices] 中（已漂移！）"))
+
+sec("3. modes.json 引用的设备 / 通道 / profile")
+if not os.path.isfile(mod_p):
+    ng(f"无 {mod_p}")
+    sys.exit(1)
+with open(mod_p, encoding="utf-8") as f:
+    mj = json.load(f)
+bad_uid, bad_prof, empty = set(), set(), []
+for m in mj.get("modes", []):
+    ads = m.get("all_device_settings", {})
+    if not ads:
+        empty.append(m.get("uid"))
+        continue
+    for u, chans in ads.items():
+        name = devices.get(u)
+        if name is None:
+            bad_uid.add(u)
+            extra = ""
+            if not re.fullmatch(r"[0-9a-f]{64}", str(u)):
+                extra = "  ← 不像 64 位 hex：modes.json 未渲染（还留着占位符）？"
+            print(f"  {m['uid']:<12} 设备 {str(u)[:12]}…  \033[31m✗ 不在 [devices] 中\033[0m{extra}")
+        else:
+            ch_list = ", ".join(f"{c}→{v.get('profile_uid') or v.get('speed_fixed')}"
+                                for c, v in chans.items())
+            print(f"  {m['uid']:<12} {name[:24]:<24} {ch_list}")
+        for c, v in chans.items():
+            p = v.get("profile_uid")
+            if p and p not in profiles:
+                bad_prof.add(f"{m['uid']}:{p}")
+info(f"current_active_mode = {mj.get('current_active_mode')}")
+
+sec("4. 结论")
+if empty:
+    ng(f"这些 Mode 的 all_device_settings 是空的（UI 必空白）: {', '.join(empty)}")
+    print("    → modes.json 未渲染（还带着 @DEVICE_UID@ 占位符）或被 daemon 覆盖；")
+    print("      重新渲染：sudo ./render-config.py --host hs-afs-r1 --auto-uid")
+if bad_uid:
+    if any(not re.fullmatch(r"[0-9a-f]{64}", str(u)) for u in bad_uid):
+        ng("modes.json 里的设备 UID 不是合法 64 位 hex ⇒ 这份文件【没有渲染过】")
+        print("    → 模板直接拷过去用了。渲染：")
+        print(f"      sudo ./render-config.py --host hs-afs-r1 --auto-uid --config-dir {cc}")
+    else:
+        ng(f"{len(bad_uid)} 个设备 UID 与 daemon 真值对不上 ⇒ UI 里 Mode 内容必然空白")
+        print("    ★ 这就是「看不到设备/通道/设置」的根因：UID 漂移，不是模板结构问题")
+        print("    修复（按设备名重新对齐 UID，一条命令）：")
+        print(f"      sudo ./render-config.py --host hs-afs-r1 --auto-uid --config-dir {cc}")
+elif not empty:
+    ok("modes.json 引用的设备 UID 全部命中 daemon 真值")
+if bad_prof:
+    ng(f"引用了不存在的 profile: {', '.join(sorted(bad_prof))}")
+elif not empty:
+    ok("所有 profile_uid 都在 config.toml 的 profiles 中")
+if not empty and not bad_uid and not bad_prof:
+    print("  → 内容层面无问题。若 UI 仍空白，检查：")
+    print("    ① daemon 读的是不是这个目录（docker 挂载路径 / XDG 路径）")
+    print("    ② 改完要重启 daemon：sudo systemctl restart coolercontrold")
+    print("    ③ UI 硬刷新（Ctrl+F5），前端会缓存设备表")
+PY
+    echo
+    exit 0
+fi
 
 CC_CONF_DIR=""
 DEVICE_UID=""

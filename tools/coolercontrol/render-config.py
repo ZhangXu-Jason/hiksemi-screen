@@ -27,6 +27,10 @@ render-config.py —— 把 CoolerControl 模板渲染成真机上可直接使�
   # 5) 单风扇机器（只有一路 PWM）
   ./render-config.py --host hs-afs-r1 --single-channel
 
+  # 6) ★ UID 漂移自愈：Web UI 打开 Mode 时「设备/通道/设置」全空白
+  #    （多半是 daemon 重算/升级后 device UID 变了，modes.json 里的键对不上任何设备）
+  sudo ./render-config.py --host hs-afs-r1 --auto-uid
+
 占位符
 ------
   @DEVICE_UID@              必填，风扇所在设备的 hwmon UID
@@ -47,6 +51,18 @@ render-config.py —— 把 CoolerControl 模板渲染成真机上可直接使�
      pwm1 → CPU 核心温度 → 走 hs-cpu-graph
      pwm2 → 核显 i915 温度 → 走 hs-case-graph
    both 通道都会写进 [device-settings] 与每个 Mode，避免 activate_mode 时被 Reset。
+
+★ device UID 会漂移（重要）
+   UID 是 daemon 依据设备属性算出的 sha256，【daemon 升级 / 内核 hwmon 变化】
+   都可能让它改变。一旦漂移：
+     · modes.json 的 all_device_settings 键不再是任何已知设备
+       ⇒ Web UI 打开 Mode 时「设备 / 通道 / 设置」一片空白（JSON 语法完全正确，
+         只是没有任何一条能对上设备，最容易误判成「模板错了」）
+     · config.toml 的 [device-settings] 同样失效 ⇒ 风扇不受控
+   daemon 每次启动都会用真值重写 config.toml 的 [devices] 段 ⇒ 那是唯一权威来源。
+   ⇒ 用 --auto-uid 按【设备名】重新对齐 UID，可一键自愈：
+       ./render-config.py --host hs-afs-r1 --auto-uid
+   排查：probe-coolercontrol.sh modes
 """
 
 import argparse
@@ -77,6 +93,11 @@ HOST_PRESETS = {
         "case_temp_name": "temp1",
         "case_temp_device_uid":
             "58cea05ead42a096567b4a1d62ed932c28b0a81abdf9ded743e0645afc0a4818",
+        # ★ --auto-uid 用：按【设备名】在 config.toml 的 [devices] 段里查真值 UID。
+        #   注意 case_temp_name 是【传感器名】(temp1)，而这里是【设备显示名】(i915)。
+        "fan_device_name": "it8613",
+        "cpu_temp_device_name": "Intel(R) Core(TM) i3-N305",
+        "case_temp_device_name": "i915",
         "note": "海康 HS-AFS-R1（Intel i3-N305）：双风扇 = it8613 pwm1(CPU)/pwm2(机箱)；"
                 "温度源 = CPU 核心 + 核显 i915",
     },
@@ -111,6 +132,90 @@ def substitute(text, mapping):
         die(f"仍有未替换的占位符: {', '.join(leftover)}"
             "（请用 --no-graph 或补全对应参数）")
     return text
+
+
+# ── ★ device UID 自动对齐（--auto-uid）───────────────────────────────────────
+#   CoolerControl 的 device UID 是 daemon 依据设备属性算出的 sha256，
+#   daemon 升级 / 内核 hwmon 变化都会让它【漂移】。漂移后：
+#     · modes.json 的 all_device_settings 键不再对应任何已知设备
+#       ⇒ Web UI 打开 Mode 时「设备 / 通道 / 设置」一片空白（JSON 语法完全正确！
+#         所以别急着改模板结构，先怀疑 UID）
+#     · config.toml 的 [device-settings] 同样失效 ⇒ 风扇不受控
+#   daemon 每次启动都会用真值重写 config.toml 的 [devices] 段 ⇒ 唯一权威来源。
+#   ⇒ 按【设备名】反查 UID 即可一键自愈。
+
+def parse_devices_section(cfg_path):
+    """从现有 config.toml 的 [devices] 段解析 {uid: device_name}。
+
+    ★ 故意不用 tomllib：真机上这份文件由 daemon 重写，可能含我们模板里没有的
+      项；而这里只需要 [devices] 段的 `uid = "name"` 行，正则足够稳且不挑版本。
+    返回 (dict, err_msg)；失败时 dict 为 None。
+    """
+    try:
+        with open(cfg_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        return None, f"读取失败: {e}"
+    m = re.search(r"^\[devices\][ \t]*$(.*?)(?=^[ \t]*\[)", text,
+                  flags=re.M | re.S)
+    if not m:
+        return None, "未找到 [devices] 段"
+    dev = {}
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        mm = re.match(r'^"?([0-9a-fA-F]{64})"?[ \t]*=[ \t]*"(.*)"[ \t]*$', line)
+        if mm:
+            dev[mm.group(1)] = mm.group(2)
+    if not dev:
+        return None, '[devices] 段里没有可解析的 uid = "name" 行'
+    return dev, ""
+
+
+def find_device_uid(devmap, want_name, label):
+    """按设备名在 [devices] 里反查 UID。返回 (uid|None, 提示msg)。"""
+    if not want_name:
+        return None, f"{label}: 未指定设备名，跳过对齐"
+    exact = sorted(u for u, n in devmap.items() if n == want_name)
+    if len(exact) == 1:
+        return exact[0], ""
+    if len(exact) > 1:
+        return exact[0], (f"{label}: [devices] 中有 {len(exact)} 个同名 "
+                          f"{want_name!r}，取第一个")
+    fuzzy = sorted(u for u, n in devmap.items() if want_name.lower() in n.lower())
+    if fuzzy:
+        msg = (f"{label}: 未精确匹配 {want_name!r}，按子串命中 "
+               f"{devmap[fuzzy[0]]!r}")
+        if len(fuzzy) > 1:
+            msg += f"（共 {len(fuzzy)} 个候选，取第一个）"
+        return fuzzy[0], msg
+    return None, f"{label}: [devices] 中找不到设备名 {want_name!r}"
+
+
+def sync_devices_section(text, name_to_uid):
+    """让 [devices] 段里指定设备名的行改用【本次实际使用的 UID】。
+
+    该段只是给人看的名字表（daemon 每次启动都会重写），但如果不跟着改，
+    渲染产物内部就会自相矛盾：[devices] 是旧 UID、[device-settings] 是新 UID
+    ⇒ 排查脚本（probe-coolercontrol.sh modes）和肉眼都会误判成「UID 漂移」。
+    """
+    m = re.search(r"^\[devices\][ \t]*$(.*?)(?=^[ \t]*\[)", text, flags=re.M | re.S)
+    if not m:
+        return text
+    body = m.group(1)
+    new_body = body
+    for line in body.splitlines():
+        mm = re.match(r'^"?([0-9a-fA-F]{64})"?[ \t]*=[ \t]*"(.*)"[ \t]*$', line.strip())
+        if not mm:
+            continue
+        old, name = mm.group(1), mm.group(2)
+        new = name_to_uid.get(name)
+        if new and new != old:
+            new_body = new_body.replace(old, new)
+    if new_body == body:
+        return text
+    return text[:m.start(1)] + new_body + text[m.end(1):]
 
 
 def strip_json_comments(text):
@@ -289,6 +394,17 @@ def main():
                     help="单风扇机器：只渲染一路（用 --cpu-channel），智能档走 CPU 曲线")
     ap.add_argument("--no-graph", action="store_true",
                     help="不生成 Graph 曲线，智能档退化为 Fixed 兜底")
+    ap.add_argument("--auto-uid", action="store_true",
+                    help="★ 从 --config-dir 的 config.toml [devices] 段按【设备名】"
+                         "自动对齐 device UID（修 Mode 在 UI 显示空白 / 风扇不受控）")
+    ap.add_argument("--config-dir", default="",
+                    help="--auto-uid 读取的 CoolerControl 配置目录（默认 /etc/coolercontrol）")
+    ap.add_argument("--fan-device-name", default="",
+                    help="风扇设备名（[devices] 段的显示名，默认 it8613）")
+    ap.add_argument("--cpu-temp-device-name", default="",
+                    help="CPU 温度所在设备的显示名（[devices] 段）")
+    ap.add_argument("--case-temp-device-name", default="",
+                    help="机箱温度所在设备的显示名（[devices] 段）")
     ap.add_argument("--out-dir", default="",
                     help="输出目录（默认 /etc/coolercontrol）")
     ap.add_argument("--check", action="store_true",
@@ -308,6 +424,9 @@ def main():
                   f"    CPU 温度 UID : {p['cpu_temp_device_uid']}\n"
                   f"    机箱温度源   : {p.get('case_temp_name', '（无）')}\n"
                   f"    机箱温度 UID : {p.get('case_temp_device_uid', '（无）')}\n"
+                  f"    --auto-uid 设备名: 风扇={p.get('fan_device_name', '?')} / "
+                  f"CPU温度={p.get('cpu_temp_device_name', '?')} / "
+                  f"机箱温度={p.get('case_temp_device_name', '?')}\n"
                   f"    备注         : {p.get('note', '')}")
         return 0
 
@@ -341,11 +460,54 @@ def main():
             case_temp_name = p.get("case_temp_name", "")
         if case_temp_uid is None:
             case_temp_uid = p.get("case_temp_device_uid", "")
+        args.fan_device_name = args.fan_device_name or p.get("fan_device_name", "")
+        args.cpu_temp_device_name = args.cpu_temp_device_name or \
+            p.get("cpu_temp_device_name", "")
+        args.case_temp_device_name = args.case_temp_device_name or \
+            p.get("case_temp_device_name", "")
         info(f"使用机型预设 {args.host}：{p.get('note', '')}")
     case_temp_name = (case_temp_name or "").strip()
     case_temp_uid = (case_temp_uid or "").strip()
+    args.fan_device_name = (args.fan_device_name or "it8613").strip()
 
     out_dir = args.out_dir or "/etc/coolercontrol"
+
+    # ── ★ UID 自动对齐（--auto-uid）：按设备名反查 daemon 真值 ───────────────
+    #   现象：Web UI 打开 Mode 时设备/通道/设置一片空白，或风扇根本不受控。
+    #   这是 UID 漂移的典型症状（JSON/TOML 语法都是对的，只是键对不上设备）。
+    if args.auto_uid:
+        cc_dir = args.config_dir or out_dir
+        cfg_path = os.path.join(cc_dir, "config.toml")
+        devmap, err = parse_devices_section(cfg_path)
+        if not devmap:
+            die(f"--auto-uid 需要 {cfg_path} 的 [devices] 段作为真值，但{err}"
+                "\n  提示：确保 CoolerControl daemon 至少成功启动过一次"
+                "（它会重写该段），或改用 --device-uid 手工指定")
+        info(f"从 {cfg_path} 读到 {len(devmap)} 个设备（daemon 真值）")
+        slots = (
+            ("device_uid", args.fan_device_name, args.device_uid),
+            ("cpu_temp_device_uid", args.cpu_temp_device_name, args.cpu_temp_device_uid),
+            ("case_temp_device_uid", args.case_temp_device_name, case_temp_uid),
+        )
+        for slot, want, cur in slots:
+            new, msg = find_device_uid(devmap, want, slot)
+            if msg:
+                info("⚠ " + msg)
+            if not new:
+                if slot == "device_uid":
+                    die(f"device_uid 无法对齐（{msg}）——风扇设备找不到，"
+                        "请用 --fan-device-name 指定 [devices] 段里的设备名，"
+                        "或直接用 --device-uid")
+                continue
+            if new != cur:
+                info(f"★ {slot}: {(cur or '（空）')[:8]}… → {new[:8]}…"
+                     f"（设备名 {want!r}）")
+            if slot == "device_uid":
+                args.device_uid = new
+            elif slot == "cpu_temp_device_uid":
+                args.cpu_temp_device_uid = new
+            else:
+                case_temp_uid = new
 
     if not args.device_uid or not args.cpu_channel:
         die("必须提供 --device-uid 与 --cpu-channel（或用 --host <机型> 一键填充）")
@@ -417,6 +579,12 @@ def main():
         cfg_text = re.sub(
             r"# -+ 智能档兜底（仅缺机箱温度源.*?\n(?=\n# =====)", "", cfg_text, flags=re.S)
     cfg_text = substitute(cfg_text, mapping)
+    # ★ [devices] 段跟着用同样的 UID，避免产物内部自相矛盾（见 sync_devices_section）
+    cfg_text = sync_devices_section(cfg_text, {
+        args.fan_device_name: uid,
+        args.cpu_temp_device_name: args.cpu_temp_device_uid,
+        args.case_temp_device_name: case_temp_uid,
+    })
     expect_channels = (cpu_ch, case_ch) if dual else (cpu_ch,)
     cfg_doc = validate_toml(cfg_text, expect_channels=expect_channels)
 

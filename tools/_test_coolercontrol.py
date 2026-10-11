@@ -251,6 +251,73 @@ try:
                         "--cpu-channel", "pwm1", "--case-channel", "pwm1"],
                        capture_output=True, text=True)
     ok("双通道同名 rc≠0", p.returncode != 0)
+    # ── 8. --auto-uid：device UID 漂移自愈 ───────────────────────────────
+    #  真机症状：CoolerControl Web UI 打开 Mode 时「设备/通道/设置」一片空白。
+    #  ★ 99% 不是模板结构问题，而是 daemon 重算/升级后 UID 漂移，
+    #    modes.json 的键对不上任何设备。--auto-uid 按【设备名】反查真值自愈。
+    sec("[8] --auto-uid（device UID 漂移自愈）")
+    import hashlib
+    base = os.path.join(TMPROOT, "base")
+    rc, out = run_render(["--host", "hs-afs-r1"], base)
+    ok("基准渲染 rc=0", rc == 0, out[-300:])
+    with open(os.path.join(base, "config.toml"), encoding="utf-8") as f:
+        cfg_text = f.read()
+    uids = sorted(set(re.findall(r"[0-9a-f]{64}", cfg_text)))
+    drift_text = cfg_text
+    for u in uids:                      # 模拟 daemon 升级后全部 UID 漂移
+        drift_text = drift_text.replace(
+            u, hashlib.sha256(("drift" + u).encode()).hexdigest())
+    drift_dir = os.path.join(TMPROOT, "drift")
+    os.makedirs(drift_dir, exist_ok=True)
+    with open(os.path.join(drift_dir, "config.toml"), "w", encoding="utf-8") as f:
+        f.write(drift_text)
+
+    devmap, err = rc_mod.parse_devices_section(
+        os.path.join(drift_dir, "config.toml"))
+    ok("能解析 [devices] 段", bool(devmap), err)
+    truth = {n: u for u, n in (devmap or {}).items()}
+
+    d2 = os.path.join(TMPROOT, "auto")
+    rc, out = run_render(["--host", "hs-afs-r1", "--auto-uid",
+                          "--config-dir", drift_dir], d2)
+    ok("--auto-uid rc=0", rc == 0, out[-500:])
+    doc, modes, cfg, mtext = load(d2)
+    used = next(iter(modes["modes"][0]["all_device_settings"]))
+    ok("modes.json 用漂移后的 it8613 UID", used == truth.get("it8613"),
+       f"{used[:12]} vs {str(truth.get('it8613'))[:12]}")
+    ok("device-settings 用同一个 UID", set(doc["device-settings"].keys()) == {used},
+       str(set(doc["device-settings"].keys())))
+    # ★ [devices] 段若仍写旧 UID，产物内部会自相矛盾，排查脚本会误报「UID 漂移」
+    ok("[devices] 段同步为新 UID（产物内部自洽）",
+       re.search(r'^\s*"?%s"?\s*=\s*"it8613"' % used, cfg, flags=re.M) is not None)
+    cpu_g = next(p for p in doc["profiles"] if p["uid"] == "hs-cpu-graph")
+    case_g = next(p for p in doc["profiles"] if p["uid"] == "hs-case-graph")
+    ok("CPU 曲线温度源 UID 已对齐",
+       cpu_g["temp_source"]["device_uid"] == truth.get("Intel(R) Core(TM) i3-N305"))
+    ok("机箱曲线温度源 UID 已对齐",
+       case_g["temp_source"]["device_uid"] == truth.get("i915"))
+    # 负例：没有 config.toml / 风扇设备名找不到 —— 都必须报错而不是静默用旧值
+    empty_cc = os.path.join(TMPROOT, "emptycc")
+    os.makedirs(empty_cc, exist_ok=True)
+    rc, out = run_render(["--host", "hs-afs-r1", "--auto-uid",
+                          "--config-dir", empty_cc], os.path.join(TMPROOT, "neg1"))
+    ok("无 config.toml 时 rc≠0", rc != 0)
+    rc, out = run_render(["--host", "hs-afs-r1", "--auto-uid",
+                          "--config-dir", drift_dir,
+                          "--fan-device-name", "no-such-device"],
+                         os.path.join(TMPROOT, "neg2"))
+    ok("风扇设备名找不到时 rc≠0", rc != 0)
+
+    # ── 9. 探测脚本含 modes 诊断子命令 ──────────────────────────────────
+    sec("[9] probe-coolercontrol.sh modes 诊断")
+    probe = os.path.join(CC_DIR, "probe-coolercontrol.sh")
+    ptxt = open(probe, encoding="utf-8").read()
+    ok("支持 modes 子命令", re.search(r'^\s*if \[ "\$\{1:-\}" = "modes" \]',
+                                     ptxt, flags=re.M) is not None)
+    ok("诊断会比对 daemon 真值 [devices] 段", "[devices]" in ptxt)
+    ok("诊断会提示 --auto-uid 修复", "--auto-uid" in ptxt)
+    ok("诊断能识别未渲染的占位符", "未渲染" in ptxt)
+
 finally:
     shutil.rmtree(TMPROOT, ignore_errors=True)
 
