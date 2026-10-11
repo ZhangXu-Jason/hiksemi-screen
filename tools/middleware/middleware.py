@@ -344,31 +344,133 @@ def resolve_command(spec, ctx):
         return spec.get("default")
 
 
+# ── hwmon（硬件传感器）扫描 ────────────────────────────────────────────────
+# 扫描根可通过环境变量覆盖（测试注入临时目录用）
+HWMON_ROOT = os.environ.get("HIKSEMI_HWMON_ROOT", "/sys/class/hwmon")
+# ★ 保留字：自动挑选（不是芯片名！）
+HWMON_AUTO = "auto"
+
+_hwmon_probed = False      # 设备摘要只记一次
+_hwmon_logged = set()      # 已记过的 (label, hwmonN) 组合
+
+
+def _hwmon_devices():
+    """返回 [(dir, name)]，按 hwmonN 序号升序"""
+    out = []
+    try:
+        dirs = sorted(glob.glob(os.path.join(HWMON_ROOT, "hwmon*")))
+    except Exception:
+        dirs = []
+    for d in dirs:
+        name = ""
+        try:
+            with open(os.path.join(d, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            pass
+        out.append((d, name))
+    return out
+
+
+def _hwmon_read(d, field):
+    try:
+        with open(os.path.join(d, field)) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _hwmon_usable(raw):
+    """温度原始值是否可用：必须是数字且 > 0（排除 0 / 负数 / 空串）"""
+    try:
+        return float(raw) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _hwmon_log_probe(devs):
+    """首次扫描时记录硬件结论（quiet 级，永不被抑制，排障第一手资料）"""
+    global _hwmon_probed
+    if _hwmon_probed:
+        return
+    _hwmon_probed = True
+    if devs:
+        summary = ", ".join(f"{os.path.basename(d)}={n or '?'}" for d, n in devs)
+        log(f"hwmon 探测：{len(devs)} 个设备 → {summary}", level="quiet")
+    else:
+        log(f"hwmon 探测：{HWMON_ROOT} 下无 hwmon* 设备 → 温度将恒为 default", level="quiet")
+
+
+def _hwmon_log_select(label, d, name, field, raw, auto):
+    """记录温度源选中结果；同一 (字段, 设备) 只记一次，换设备时会再记"""
+    key = (label, os.path.basename(d))
+    if key in _hwmon_logged:
+        return
+    _hwmon_logged.add(key)
+    tag = "auto" if auto else "指定"
+    log(f"hwmon 选中（{tag}）：{label} ← {os.path.basename(d)}({name or '?'}) "
+        f"{field}={raw}", level="quiet")
+
+
 def resolve_hwmon(spec, ctx):
     """在 /sys/class/hwmon 下按 chip 名匹配传感器文件。
+
     例：{"source":"hwmon","chip":"coretemp","field":"temp1_input","scale":0.001}
-    chip 可省略（取第一个含该 field 的）；field 默认 temp1_input。"""
-    chip = (spec.get("chip") or "").lower()
+
+    ★★ "auto" 是【保留字】，不是芯片名！
+        它表示「自动挑第一个含该 field 且值可用的设备」。
+        （历史 bug：旧版把它当字面芯片名去 `chip not in name` 匹配，
+          "auto" 不在任何 hwmon 名字里 ⇒ 所有设备被跳过 ⇒ 恒定返回 default
+          ⇒ 小屏 CPU/机箱温度永远不变。教训 89。）
+
+    chip 支持三种形态：
+        "coretemp"           单个芯片名（子串匹配，忽略大小写）
+        ["coretemp", "auto"] 列表，按顺序尝试，前面的优先；末尾放 "auto" 即兜底
+        "auto" / 省略        直接自动挑选
+
+    exclude: 芯片名子串列表，仅在 auto 阶段跳过（用于让两个温度字段避开同一个源）
+    """
+    chips = spec.get("chip")
+    if chips is None:
+        chips = [HWMON_AUTO]
+    elif isinstance(chips, str):
+        chips = [chips]
     field = spec.get("field", "temp1_input")
-    try:
-        for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
-            try:
-                name = ""
-                name_path = os.path.join(d, "name")
-                if os.path.exists(name_path):
-                    with open(name_path) as f:
-                        name = f.read().strip().lower()
-                if chip and chip not in name:
-                    continue
-                p = os.path.join(d, field)
-                if not os.path.exists(p):
-                    continue
-                with open(p) as f:
-                    return _postprocess(f.read().strip(), spec)
-            except OSError:
+    label = spec.get("_label") or field
+    excludes = [str(e).strip().lower() for e in (spec.get("exclude") or [])]
+
+    devs = _hwmon_devices()
+    _hwmon_log_probe(devs)
+
+    # ① 按 chip 名顺序精确匹配（非 auto）
+    for chip in chips:
+        c = (chip or "").strip().lower()
+        if not c or c == HWMON_AUTO:
+            continue
+        for d, name in devs:
+            if c not in name.lower():
                 continue
-    except Exception:
-        pass
+            raw = _hwmon_read(d, field)
+            if raw is None or not _hwmon_usable(raw):
+                continue
+            _hwmon_log_select(label, d, name, field, raw, auto=False)
+            return _postprocess(raw, spec)
+
+    # ② auto：第一个含该 field、值可用且不在 exclude 里的设备
+    if HWMON_AUTO in [str(c).strip().lower() for c in chips]:
+        for d, name in devs:
+            if any(e in name.lower() for e in excludes):
+                continue
+            raw = _hwmon_read(d, field)
+            if raw is None or not _hwmon_usable(raw):
+                continue
+            _hwmon_log_select(label, d, name, field, raw, auto=True)
+            return _postprocess(raw, spec)
+
+    log_err("hwmon_miss",
+            f"hwmon 未匹配到任何设备：chip={chips} field={field} "
+            f"→ 温度将恒为 default({spec.get('default')})，请检查 /sys/class/hwmon",
+            level="quiet")
     return spec.get("default")
 
 

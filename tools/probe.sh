@@ -34,12 +34,14 @@ usage() {
   i2c-led          ★ I2C 控灯协议交互探测（需 root，会实际点灯）
   enable-i2c       启用 I2C 灯控通道并持久化到重启
   fan              委托 coolercontrol/probe-coolercontrol.sh 探测风扇落地条件
+  temp             ★ 温度传感器探测（小屏 CPU/机箱温度「永远不变」时跑这个）
 
 用法：
   sudo bash probe.sh                # 只读快照
   sudo bash probe.sh i2c-led        # 灯不亮/换硬件时用，会点灯
   sudo bash probe.sh enable-i2c     # 全新部署后启用灯控
   sudo bash probe.sh fan            # 看 CoolerControl 能不能落地
+  sudo bash probe.sh temp           # 温度不刷新 / 想换温度源时用
 ============================================================
 EOF
 }
@@ -47,7 +49,7 @@ EOF
 CMD="${1:-env}"
 case "$CMD" in
     -h|--help) usage; exit 0 ;;
-    env|i2c-led|enable-i2c|fan) ;;
+    env|i2c-led|enable-i2c|fan|temp) ;;
     *) echo "未知子命令：$CMD（--help 看用法）" >&2; exit 2 ;;
 esac
 
@@ -304,6 +306,63 @@ run_i2c_led() {
 }
 
 # ══════════════════════════════════════════════════════════════
+# temp · 温度传感器探测（★ 小屏温度「永远不变」时跑这个）
+# ══════════════════════════════════════════════════════════════
+run_temp() {
+    echo "$BAR"
+    echo " hiksemi-sub · 温度传感器探测"
+    echo " （CPU/机箱温度恒定时用：看真实芯片名 + 中间件实际取到什么）"
+    echo "$BAR"
+
+    echo
+    echo "############ ① /sys/class/hwmon 设备清单 ############"
+    local d f n v hit=0
+    for d in /sys/class/hwmon/hwmon*; do
+        [ -d "$d" ] || continue
+        hit=1
+        n=$(cat "$d/name" 2>/dev/null || echo '?')
+        echo "  ${d##*/}: $n"
+        for f in "$d"/temp*_input; do
+            [ -r "$f" ] || continue
+            v=$(cat "$f" 2>/dev/null)
+            printf "      %-14s = %-8s → %.1f ℃\n" "${f##*/}" "$v" \
+                   "$(awk -v x="$v" 'BEGIN{printf "%.1f", x/1000}')"
+        done
+    done
+    [ "$hit" = 0 ] && echo "  ❌ /sys/class/hwmon 下没有任何设备（温度只能走 default）"
+
+    echo
+    echo "############ ② 中间件实际会取到的值 ############"
+    local py="$SCRIPT_DIR/middleware/middleware.py"
+    local mp="$SCRIPT_DIR/middleware/data-mapping.json"
+    if [ -f "$py" ] && [ -f "$mp" ] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$py" "$mp" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+import middleware as mw
+cfg = json.load(open(sys.argv[2], encoding='utf-8'))
+spec = cfg['actions']['get_hw_resource_info']
+for k in ('cpu_temp', 'temperature'):
+    s = spec.get(k) or {}
+    v = mw.resolve_hwmon(s, {})
+    tag = "⚠ 等于 default（没匹配上真实芯片）" if v == s.get('default') else "✓ 来自真实传感器"
+    print(f"  {k:12s} = {v} ℃   {tag}")
+    print(f"               chip={s.get('chip')}  field={s.get('field')}  default={s.get('default')}")
+PY
+    else
+        echo "  ⚠ 缺少 middleware.py / data-mapping.json / python3，跳过"
+    fi
+
+    echo
+    echo "############ ③ 结论与处理 ############"
+    echo "  · 若 ② 显示「没匹配上」→ 把 ① 里看到的真实 name 填进"
+    echo "    data-mapping.json 的 chip 列表（按顺序优先，末尾保留 \"auto\" 兜底）。"
+    echo "  · 若 CPU 与机箱温度来自同一设备 → 给 temperature 补 exclude 排除 CPU 芯片名。"
+    echo "  · ★ 不要把 chip 写成不存在的字面名（历史 bug：写 \"auto\" 被当芯片名 → 全跳过）。"
+    echo "$BAR"
+}
+
+# ══════════════════════════════════════════════════════════════
 # fan · 委托 coolercontrol 探测脚本
 # ══════════════════════════════════════════════════════════════
 run_fan() {
@@ -323,4 +382,5 @@ case "$CMD" in
     enable-i2c) run_enable_i2c ;;
     i2c-led)    run_i2c_led ;;
     fan)        run_fan "$@" ;;
+    temp)       run_temp ;;
 esac

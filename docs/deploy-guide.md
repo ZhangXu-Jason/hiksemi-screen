@@ -169,8 +169,8 @@ sudo vi "$TOOLS/middleware/data-mapping.json"
 | 想改什么         | 改哪里                                                                |                      |
 | ------------ | ------------------------------------------------------------------ | -------------------- |
 | 主网卡名（MAC 取值） | `get_sys_info` → `mac`（**默认自动探测，一般不用改**；要固定就加 `"iface": "enp2s0"`） |                      |
-| CPU 温度来源     | `get_hw_resource_info` → `cpu_temp` → `chip`（如 `coretemp`）         |                      |
-| 硬盘/SSD 温度    | `temperature` → `chip`（`nvme` / `drivetemp`）                       |                      |
+| CPU 温度来源     | `get_hw_resource_info` → `cpu_temp` → `chip`（**列表**，按顺序优先：默认 `coretemp`→`x86_pkg_temp`→`k10temp`→`zenpower`→`auto` 兜底）。★ 不要写成单个不存在的字面名 |
+| 机箱/设备温度     | `temperature` → `chip`（默认 `i915`/核显优先，其次 `it8613`/`nct*`/`acpitz`）+ `exclude` 排除 CPU 芯片名，防止两个温度取到同一个传感器 |
 | 盘位数/匹配规则     | `space_manage` → `pattern`（默认 \`sd[a-z]                            | nvme[0-9]+n[0-9]+\`） |
 | 存储空间挂载点      | `get_space_list` → `mounts`（留空自动探测 `/vol*`）                        |                      |
 | 排除的网卡        | `get_eth_info_v2` → `exclude`                                      |                      |
@@ -489,7 +489,7 @@ getDeviceStatus()  （index-be27a12a.js:20794）
 
 | tty1 无法登录 | 服务占用了 tty1：先 `sudo systemctl stop hiksemi-sub` |
 
-| 温度显示 default 值 45/38 | `cat /sys/class/hwmon/*/name` 找实际传感器名，改配置里的 `chip` |
+| 温度恒定不变 / 一直显示 45、38 | ★ 先跑 `sudo bash probe.sh temp`（列出真实芯片名 + 中间件实际取到的值 + 是否命中 default）。**历史 bug（教训 89）**：配置写 `"chip": "auto"` 被解析器当成字面芯片名做子串匹配 ⇒ 所有设备被跳过 ⇒ 恒返回 `default`。现已修好（`auto` = 自动挑选 + 芯片列表优先）。若真机芯片名不在默认列表里，把 `probe.sh temp` 显示的 name 填进 `chip` 列表（末尾保留 `"auto"`） |
 
 | 日志刷屏 `采样异常` | 已做抑制：首次完整报出 + 每 10/100/1000 次提示 + 恢复时提示。若持续异常，说明本机 `/proc` 不可读（中间件应在 Linux 运行） |
 

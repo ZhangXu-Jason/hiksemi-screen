@@ -70,19 +70,22 @@
       "fanmode": "state",
       "cpu_temp": {
         "source": "hwmon",
-        "chip": "auto",
+        "chip": ["coretemp", "x86_pkg_temp", "k10temp", "zenpower", "auto"],
         "field": "temp1_input",
         "scale": 0.001,
         "default": 45,
-        "_note": "CPU 温度（℃）。hwmon chip=auto 会自动挑一个温度传感器；取不到用 default"
+        "_label": "CPU温度",
+        "_note": "CPU 温度（℃）。chip 按顺序尝试：coretemp(Intel/AMD 标准) → x86_pkg_temp → k10temp(AMD) → zenpower → auto 兜底（第一个含 temp1_input 且 >0 的设备）。★★ 不要把 chip 写成单个 \"auto\" 之外的无效字面名——旧版正是把 \"auto\" 当芯片名匹配导致全部跳过、温度恒为 default（教训 89）。真机可用 `for d in /sys/class/hwmon/hwmon*; do echo -n \"$d: \"; cat $d/name; done` 核对实际芯片名"
       },
       "temperature": {
         "source": "hwmon",
-        "chip": "auto",
+        "chip": ["i915", "it8613", "nct6683", "nct6798", "acpitz", "auto"],
+        "exclude": ["coretemp", "x86_pkg_temp", "k10temp", "zenpower"],
         "field": "temp1_input",
         "scale": 0.001,
         "default": 38,
-        "_note": "设备/主板温度（℃）"
+        "_label": "机箱温度",
+        "_note": "设备/机箱温度（℃）。HS-AFS-R1 上机箱热源取 i915（核显，与 CoolerControl 机箱曲线同源）；其次 it8613(ITE 超级 I/O) / nct(华邦) / acpitz。exclude 用于 auto 兜底时避开 CPU 源，防止两个温度显示成同一个值"
       },
       "disk_manage": {
         "source": "builder",
