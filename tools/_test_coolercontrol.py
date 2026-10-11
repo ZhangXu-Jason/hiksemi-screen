@@ -714,6 +714,120 @@ fan4 = { disabled = true }
     ok("解除绑定后 reason=name（回落到名字匹配）",
        ex[4]["reason"] == "name" and ex[4]["bind_value"] == "", out[:300])
 
+    # ── [16] "模式改了但 config.toml 没变" 修复 ──────────────────────────────
+    #  核心：① ensure_apply_on_boot 必须把键放进 [settings] 段（不是文件头！）
+    #        ② config_matches_mode 能正确识别引号写法（段头 uid + 通道键）
+    #        ③ 落地脚本给出 exit 5 判据 + 第二重回读
+    sec("[16] apply_on_boot 与 config.toml 一致性（模式改了配置没变）")
+
+    a3 = open(APPLY, encoding="utf-8", errors="replace").read()
+    ok("apply-mode.sh 新增 ensure_apply_on_boot", "ensure_apply_on_boot()" in a3)
+    ok("apply-mode.sh 新增 config_matches_mode", "config_matches_mode()" in a3)
+    ok("落地前确保 apply_on_boot=true", "确保 apply_on_boot=true" in a3)
+    ok("config.toml 不符时非零退出（exit 5 判据）", "exit 5" in a3)
+    ok("★ 键写进 [settings] 段而非文件头（TOML 语义）",
+       "find_sec" in a3 and 'lines.insert(start' in a3)
+    ok("识别注释里的 apply_on_boot（不误判）",
+       r'^[ \t]*apply_on_boot[ \t]*=[ \t]*true[ \t]*(#.*)?$' in a3)
+    ok("probe sync 新增 ⑦ 环",
+       "⑦ config.toml 与 modes.json 是否一致" in ptxt)
+    ok("probe ⑦ 有 NG 时给出结论（模式改了配置没跟上）",
+       "模式改了但 config.toml 没跟上" in ptxt)
+    ok("probe ⑦ 提示 apply_on_boot",
+       "apply_on_boot 必须 = true" in ptxt)
+
+    # 提取 ensure_apply_on_boot 独立可执行体，做行为验证
+    fn_m = re.search(r"ensure_apply_on_boot\(\) \{.*?\n\}\n", a3, flags=re.S)
+    ok("ensure_apply_on_boot 可提取", bool(fn_m))
+
+    if fn_m:
+        eh = os.path.join(TMPROOT, "fn_ab.sh")
+        with open(eh, "w", encoding="utf-8", newline="\n") as f:
+            f.write("#!/usr/bin/env bash\nset -uo pipefail\n"
+                    'CONFIG_TOML="$1"\n' + fn_m.group(0) +
+                    "\nensure_apply_on_boot; echo rc=$?\n")
+
+        def run_ab(content):
+            p = os.path.join(TMPROOT, "ab.toml")
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+            r = subprocess.run(["bash", eh, p], capture_output=True, text=True)
+            return r.returncode, open(p, encoding="utf-8").read()
+
+        # ① 已有 true（在段内）→ 文件不被改动
+        c = '[devices]\nfoo = 1\n\n[settings]\napply_on_boot = true\n'
+        rc, after = run_ab(c)
+        ok("① apply_on_boot 已 true → 不改动文件", after == c, after)
+
+        # ② [settings] 存在但缺键 → 插进 [settings] 段内
+        rc, after = run_ab('[devices]\nfoo = 1\n\n[settings]\ntimeout = 5\n')
+        lines = after.splitlines()
+        si = lines.index("[settings]")
+        ok("② 键插进 [settings] 段内（紧跟段头，非文件头）",
+           lines[si + 1] == "apply_on_boot = true", after)
+
+        # ③ 无 [settings] 段 → 追加新段
+        rc, after = run_ab('[devices]\nfoo = 1\n')
+        ok("③ 无 [settings] → 末尾追加 [settings] 段",
+           "[settings]" in after and after.rstrip().endswith("apply_on_boot = true"),
+           after)
+
+        # ④ false → 就地改 true
+        rc, after = run_ab('[settings]\napply_on_boot = false\n')
+        ok("④ false → 就地改 true",
+           "apply_on_boot = true" in after and "false" not in after, after)
+
+        # ⑤ 注释里的 apply_on_boot 不得被当成真实键
+        rc, after = run_ab('# apply_on_boot = true 说明\n[settings]\nx = 1\n')
+        body = after.split("[settings]", 1)[1]
+        ok("⑤ 注释不误判，真实键落在 [settings] 段内",
+           "apply_on_boot = true" in body, after)
+
+        # ⑥ 幂等
+        rc, a1 = run_ab('[settings]\ntimeout = 5\n')
+        rc, a2 = run_ab(a1)
+        ok("⑥ ensure_apply_on_boot 幂等", a1 == a2, a2)
+
+    # config_matches_mode 行为验证（引号写法必须认）
+    cm_m = re.search(r"config_matches_mode\(\) \{.*?\n\}\n", a3, flags=re.S)
+    ok("config_matches_mode 可提取", bool(cm_m))
+    if cm_m:
+        ch = os.path.join(TMPROOT, "fn_cm.sh")
+        with open(ch, "w", encoding="utf-8", newline="\n") as f:
+            f.write("#!/usr/bin/env bash\nset -uo pipefail\n"
+                    'MODE_CONFIG="$1"; CONFIG_TOML="$2"; MODE_UID="$3"\n' +
+                    cm_m.group(0) + "\nconfig_matches_mode; echo rc=$?\n")
+        cm_modes = os.path.join(TMPROOT, "cm_modes.json")
+        with open(cm_modes, "w", encoding="utf-8") as f:
+            json.dump({"current_active_mode": "A", "modes": [
+                {"uid": "A", "name": "curve",
+                 "all_device_settings": {"dev1": {"fan3": {"profile_uid": "PC"},
+                                                   "fan2": {"profile_uid": "PK"}}}},
+                {"uid": "B", "name": "fixed",
+                 "all_device_settings": {"dev1": {"fan3": {"speed_fixed": 25},
+                                                   "fan2": {"speed_fixed": 25}}}}]}, f)
+
+        def run_cm(cfg, uid):
+            p = os.path.join(TMPROOT, "cm.toml")
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write(cfg)
+            r = subprocess.run(["bash", ch, cm_modes, p, uid],
+                               capture_output=True, text=True)
+            return r.stdout.strip()
+
+        ok("⑦ 引号段头+引号通道 判一致（★ 修过的假阴性）",
+           run_cm('[device-settings."dev1"]\n"fan3" = { profile_uid = "PC" }\n'
+                  '"fan2" = { profile_uid = "PK" }\n', "A") == "rc=0")
+        ok("⑧ 内容不符时判不一致",
+           run_cm('[device-settings."dev1"]\n"fan3" = { speed_fixed = 25 }\n'
+                  '"fan2" = { speed_fixed = 25 }\n', "A") == "rc=1")
+        ok("⑨ Fixed 档位自比对一致",
+           run_cm('[device-settings."dev1"]\n"fan3" = { speed_fixed = 25 }\n'
+                  '"fan2" = { speed_fixed = 25 }\n', "B") == "rc=0")
+        ok("⑩ 空 Mode 视为不一致（激活无意义）",
+           run_cm('[device-settings."dev1"]\n"fan3" = { speed_fixed = 25 }\n',
+                  "ZZZ") == "rc=1")
+
 finally:
     shutil.rmtree(TMPROOT, ignore_errors=True)
 

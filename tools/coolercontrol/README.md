@@ -232,6 +232,16 @@ sudo grep -i 'fan' /var/log/hiksemi-sub/kiosk.log
   **Mode 未覆盖的 channel 做 Reset**，因此改 `modes.json` 的
   `current_active_mode` 后重启 daemon 即生效。
 - `apply_on_boot = true` 时，daemon 启动会重新应用 `[device-settings]`。
+  ★ **必须在 `[settings]` 段内**（放文件头 = 顶层键 = daemon 读不到）；
+  `apply-mode.sh` 落地前会用 `ensure_apply_on_boot()` 自动确保它在正确位置。
+  ★ 若为 `false`，改 `modes.json` 后 `config.toml` **不会跟着变** —— 这正是
+  「模式改了、配置文件却没变」的根因。
+- `apply-mode.sh` 落地后做**第二重回读**：`config_matches_mode()` 解析 `config.toml`
+  的 `[device-settings.<uid>]`，逐通道比对当前 Mode 内容；不符则强制重应用一次，
+  仍不符则以 **`exit 5`** 告警（指向 `probe-coolercontrol.sh sync` 的 ⑦ 环）。
+
+**退出码**：`0`=成功 / `2`=参数或文件问题 / `3`=无重启通道 /
+`4`=`current_active_mode` 被改回 / `5`=`config.toml` 与 Mode 内容不符。
 
 ## 注意事项
 

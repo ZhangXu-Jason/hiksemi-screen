@@ -583,6 +583,53 @@ sudo systemctl restart hiksemi-sub
 sudo ./probe-coolercontrol.sh watch 30
 ```
 
+### 6.9 ★★ 「模式改了，配置文件却变回原来的」—— apply_on_boot 与 config.toml 一致性
+
+**症状**：在小屏上切换档位后，`modes.json` 的 `current_active_mode` **确实变了**
+（切成目标 Mode），但 `config.toml` 的 `[device-settings]` 内容**却退回/停在旧档**，
+于是「模式（modes.json）」与「实际生效配置（config.toml）」对不上。
+
+**根因**：CoolerControl daemon 只有在 `config.toml` 的 `[settings] apply_on_boot = true`
+时，才会在**启动时**读取 `modes.json` 的 `current_active_mode` 并应用它。
+若该键为 `false`（或被 daemon/升级重写掉），daemon 启动后**不应用** active mode ——
+`modes.json` 改了、`config.toml` 纹丝不动，症状与"切档没生效"完全一样。
+
+> ★ `apply_on_boot` 属于 **`[settings]` 段**，不是顶层键。若把它写到文件头
+> （第一个 `[section]` 之前），TOML 会当成顶层键 ⇒ daemon 读不到 ⇒ 看似"修了"实则无效。
+> 这是本类 bug 最隐蔽的坑：**改是改了，但放错了段**。
+
+**修复**（`apply-mode.sh`）：
+
+1. **`ensure_apply_on_boot()`** —— 落地前确保 `[settings]` 段内 `apply_on_boot = true`：
+   - 段内已有该键 → 就地改 `true`；
+   - 有 `[settings]` 但无该键 → **插到段头之后**（段内首行）；
+   - 连 `[settings]` 段都没有 → 文件末尾追加一个 `[settings]` 段；
+   - 注释里的 `apply_on_boot` 文本**不误判**；操作**幂等**。
+2. **`config_matches_mode()`** —— 第二重回读：解析 `config.toml` 的
+   `[device-settings.<uid>]` 段，逐通道对比当前激活 Mode 的 `all_device_settings`
+   （`profile_uid` / `speed_fixed`）。返回 `0`=一致 / `1`=不一致 / `2`=无法判定。
+   - ★ 段头两种写法（`[device-settings."uid"]` 与 `[device-settings.uid]`）都要认，
+     通道行 `"fan3" = { ... }` 的**引号也必须容忍** —— 否则会误报"不一致"（假阴性）。
+   - 空 Mode（`all_device_settings` 为空）视为**不一致**：激活它不会改任何设置。
+3. **主流程加固**：`ensure_apply_on_boot` → `apply_once` → `sleep 2` → 回读
+   `current_active_mode` → 不一致则强制再 `apply_once` → **第二重回读 `config_matches_mode`**
+   → 若仍不符则**强制再应用一次**。
+4. **退出码 5**：`current_active_mode` 已对、但 `config.toml` 仍与 Mode 内容不符 ⇒
+   明确告警（可能 `apply_on_boot` 未生效，或 Mode 引用了 daemon 不认识的设备/通道），
+   并指向 probe ⑦ 环。
+
+**取证（一条命令，看 ⑦ 环）**：
+
+```bash
+sudo ./probe-coolercontrol.sh sync
+```
+
+`sync` 的 **⑦ 环**「config.toml 与当前 Mode 是否一致」会逐通道打印
+`config.toml=…  ≠  Mode=…`，并提示检查 `apply_on_boot` / 占位符残留。
+
+**退出码总表**：`0`=成功 / `2`=参数或文件问题 / `3`=无重启通道 /
+`4`=`current_active_mode` 被改回 / `5`=`config.toml` 与 Mode 内容不符。
+
 ## 7. 为什么用「改文件 + 重启」而不是调 REST API
 
 CoolerControl 的 REST API 需要处理 token / 会话，且路径随版本变动，

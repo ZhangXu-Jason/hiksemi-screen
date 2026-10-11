@@ -218,6 +218,95 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
         fi
     fi
 
+    SEC "⑦ config.toml 与 modes.json 是否一致（★ 模式改了但实际配置没变）"
+    #   症状：切档后 modes.json 的 current_active_mode 变了，但 config.toml 里的
+    #   [device-settings] 还是旧档的内容 ⇒ 屏幕显示 A、风扇实际跑 B。
+    #   这里直接对比「当前激活 Mode 的 all_device_settings」与 config.toml 的真实设置。
+    if [ -n "$PYBIN" ] && [ -f "$HERE/fan-mode-map.py" ]; then
+        "$PYBIN" - "$CC_DIR" <<'PY'
+import json, os, re, sys
+cc = sys.argv[1]
+cfg_p = os.path.join(cc, "config.toml")
+mod_p = os.path.join(cc, "modes.json")
+
+def info(s): print(f"  · {s}")
+def ok(s):   print(f"  \033[32m✓\033[0m {s}")
+def ng(s):   print(f"  \033[31m✗\033[0m {s}")
+
+if not os.path.isfile(mod_p):
+    ng(f"找不到 {mod_p}"); sys.exit(0)
+try:
+    mj = json.load(open(mod_p, encoding="utf-8"))
+except Exception as e:
+    ng(f"读 modes.json 失败: {e}"); sys.exit(0)
+
+cur = mj.get("current_active_mode")
+modes = {m.get("uid"): m for m in mj.get("modes", [])}
+cm = modes.get(cur)
+if not cm:
+    ng(f"current_active_mode={cur!r} 不在 modes 列表里")
+    sys.exit(0)
+info(f"当前激活 Mode: {cm.get('name')}  (uid={cur})")
+
+# config.toml 的 [device-settings.<uid>] 段（daemon 真实生效的设置）
+text = ""
+if os.path.isfile(cfg_p):
+    text = open(cfg_p, encoding="utf-8", errors="replace").read()
+cur_dev = {}
+# 取【最后一个】 [device-settings.<uid>] 段（daemon 会重写）
+# ★ 段头两种写法都要认（带引号 / 不带）⇒ 去引号再比较；通道键 likewise 允许引号，
+#   否则 `"fan3" = {...}` 匹配不上 ⇒ 误报「不一致」（本环最常见的假阴性）。
+for m in re.finditer(r"^\[device-settings\.([^\]]+)\][ \t]*$(.*?)(?=^\[|\Z)",
+                     text, flags=re.M | re.S):
+    uid = m.group(1).strip().strip('"').strip("'")
+    body = m.group(2)
+    d = {}
+    for line in body.splitlines():
+        mm = re.match(r'^\s*["\']?(fan\w+)["\']?\s*=\s*\{(.*)\}\s*$', line)
+        if not mm:
+            continue
+        ch, kv = mm.group(1), mm.group(2)
+        pu = re.search(r'profile_uid\s*=\s*"([^"]*)"', kv)
+        sf = re.search(r'speed_fixed\s*=\s*(\d+)', kv)
+        d[ch] = pu.group(1) if pu else (f"Fixed {sf.group(1)}%" if sf else "?")
+    cur_dev[uid] = d
+
+# 对比 Mode 期望的设置 vs config.toml 真实设置
+def norm(d):
+    return {k: v for k, v in (d or {}).items() if v}
+
+want_all = {}
+for dev, chans in (cm.get("all_device_settings") or {}).items():
+    want_all[dev] = norm({c: (st.get("profile_uid") or
+                              (f"Fixed {st.get('speed_fixed')}%" if "speed_fixed" in st else "?"))
+                          for c, st in (chans or {}).items()})
+
+if not want_all:
+    ng("当前 Mode 的 all_device_settings 为空 ⇒ 激活它不会改任何设置（会重置为默认）")
+    info("  ⇒ 这就是「模式变了但配置没变」的原因：Mode 里根本没有设置内容")
+    sys.exit(0)
+
+mismatch = 0
+for dev, chans in want_all.items():
+    got = cur_dev.get(dev, {})
+    for ch, want in chans.items():
+        have = got.get(ch)
+        if have != want:
+            mismatch += 1
+            ng(f"设备 {dev[:12]}… 通道 {ch}: config.toml={have!r} ≠ Mode={want!r}")
+if mismatch == 0:
+    ok("config.toml 的 [device-settings] 与当前 Mode 内容一致（已真正生效）")
+else:
+    ng(f"有 {mismatch} 处不一致 ⇒ 档位【没真正落到 config.toml】")
+    info("  ① 先看 daemon 是否重启成功（④ 环）")
+    info("  ② 再确认 apply_on_boot：config.toml 的 [settings] apply_on_boot 必须 = true")
+    info("     否则 daemon 启动时不会应用 active mode（改了 modes.json 也不落地）")
+    info("  ③ 若配置里有 @DEVICE_UID@ 等占位符残留 ⇒ 重新渲染（--auto）")
+PY
+    else
+        INFO "缺少 python3 或 fan-mode-map.py，跳过"
+    fi
+
     echo
     INFO "把上面整段输出贴给排障方即可定位。常见结论："
     INFO "  · ① 有 NG        → 脚本没同步到真机（重跑安装器，已改为内容比对同步）"
@@ -229,6 +318,7 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     INFO "  · ④ 有 NG        → 重启通道缺失，切档只写文件不生效"
     INFO "  · ⑤ 有 NG        → 改了中间件没重启"
     INFO "  · ⑥ 有 NG        → 反向同步/规则模块缺失 ⇒ 屏幕切档会自己弹回"
+    INFO "  · ⑦ 有 NG        → 模式改了但 config.toml 没跟上（档位没真正生效）"
     exit 0
 fi
 

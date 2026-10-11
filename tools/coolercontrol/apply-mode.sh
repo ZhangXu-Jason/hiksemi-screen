@@ -332,11 +332,132 @@ read_back() {
     python3 -c "import json;print(json.load(open('$MODE_CONFIG',encoding='utf-8')).get('current_active_mode',''))" 2>/dev/null
 }
 
+# ★ 回读 config.toml：当前激活 Mode 的期望设置有没有真正落进 [device-settings]。
+#   返回 0=一致 / 1=不一致 / 2=无法判定（缺文件/缺 python）。
+#   ★ 为什么需要它：daemon 只有在 apply_on_boot=true 时才会在【启动时】应用
+#     active mode。若为 false（或被 daemon 重写掉了），modes.json 改了、
+#     config.toml 却纹丝不动 ⇒ 症状正是「模式改了但配置没变」。
+config_matches_mode() {
+    [ -f "$MODE_CONFIG" ] || return 2
+    [ -f "$CONFIG_TOML" ] || return 2
+    python3 - "$MODE_CONFIG" "$CONFIG_TOML" "$MODE_UID" <<'PY' && return 0
+import json, re, sys
+mod_p, cfg_p, target = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    mj = json.load(open(mod_p, encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+cm = next((m for m in mj.get("modes", []) if m.get("uid") == target), None)
+if not cm:
+    sys.exit(1)
+want = {}
+for dev, chans in (cm.get("all_device_settings") or {}).items():
+    for c, st in (chans or {}).items():
+        want[(dev, c)] = (st.get("profile_uid") or
+                          (f"Fixed {st.get('speed_fixed')}%" if "speed_fixed" in st else "?"))
+if not want:
+    sys.exit(1)                      # 空 Mode：激活它没有意义 ⇒ 视为不匹配
+try:
+    text = open(cfg_p, encoding="utf-8", errors="replace").read()
+except Exception:
+    sys.exit(1)
+# ★ 段头两种写法都要认：`[device-settings."uid"]`（带引号）与 `[device-settings.uid]`
+#   ⇒ 统一去掉首尾引号再比较，否则 key 永远对不上（表现为"明明一致却判不一致"）。
+# ★ 通道行是 `"fan3" = { ... }`（键带引号），正则必须允许可选引号。
+got = {}
+for m in re.finditer(r'^\[device-settings\.([^\]]+)\][ \t]*$(.*?)(?=^\[|\Z)',
+                     text, flags=re.M | re.S):
+    uid = m.group(1).strip().strip('"').strip("'")
+    body = m.group(2)
+    for line in body.splitlines():
+        mm = re.match(r'^\s*["\']?(fan\w+)["\']?\s*=\s*\{(.*)\}\s*$', line)
+        if not mm:
+            continue
+        kv = mm.group(2)
+        pu = re.search(r'profile_uid\s*=\s*"([^"]*)"', kv)
+        sf = re.search(r'speed_fixed\s*=\s*(\d+)', kv)
+        got[(uid, mm.group(1))] = (pu.group(1) if pu else
+                                   (f"Fixed {sf.group(1)}%" if sf else "?"))
+sys.exit(0 if all(got.get(k) == v for k, v in want.items()) else 1)
+PY
+}
+
+# ★ 确保 config.toml 的 【[settings] 段内】 有 apply_on_boot = true。
+#   否则 daemon 启动时不会应用 active mode ⇒ modes.json 改了 config.toml 不变。
+#
+#   ★★ 关键：apply_on_boot 属于 [settings] 段（不是顶层键！）。若把它写到文件头
+#      （第一个 [section] 之前），TOML 会当成顶层键 ⇒ CoolerControl 读不到 ⇒
+#      「改是改了，但根本没生效」的假修复。所以必须：
+#        ① [settings] 段内已有该键 → 就地改成 true；
+#        ② 有 [settings] 段但无该键 → 插到 [settings] 头之后（段内首行）；
+#        ③ 连 [settings] 段都没有 → 在文件末尾追加一个 [settings] 段。
+#   返回 0=已确认，1=无法判定或改动失败。
+ensure_apply_on_boot() {
+    [ -f "$CONFIG_TOML" ] || return 1
+    # 快路径：段内（或任意处）已有 true —— 用 Python 精确定位，避免误判注释行
+    python3 - "$CONFIG_TOML" <<'PY' && return 0
+import re, sys
+t = open(sys.argv[1], encoding="utf-8").read()
+sys.exit(0 if re.search(r'^[ \t]*apply_on_boot[ \t]*=[ \t]*true[ \t]*(#.*)?$',
+                        t, flags=re.M) else 1)
+PY
+    python3 - "$CONFIG_TOML" <<'PY' || return 1
+import re, sys
+p = sys.argv[1]
+try:
+    t = open(p, encoding="utf-8").read()
+except Exception:
+    sys.exit(1)
+
+lines = t.splitlines(keepends=True)
+
+def find_sec(name):
+    """返回段体起止行号 [start, end)（start 指向段头行的下一行）。"""
+    pat = re.compile(r'^\[%s\][ \t]*$' % re.escape(name))
+    start = None
+    for i, ln in enumerate(lines):
+        if pat.match(ln.rstrip("\n")):
+            start = i + 1
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start, len(lines)):
+        if re.match(r'^\[', lines[j]):
+            end = j
+            break
+    return (start, end)
+
+# ① 任意位置的字面键（非注释）→ 就地置 true
+for i, ln in enumerate(lines):
+    if re.match(r'^[ \t]*apply_on_boot[ \t]*=', ln):
+        lines[i] = re.sub(r'^([ \t]*apply_on_boot[ \t]*=).*?(\r?\n?)$',
+                          r'\1 true\2', ln)
+        open(p, "w", encoding="utf-8").write("".join(lines))
+        sys.exit(0)
+
+sec = find_sec("settings")
+if sec:
+    start, _ = sec
+    # ② 插到 [settings] 头之后（段内首行），保持可读
+    lines.insert(start, "apply_on_boot = true\n")
+else:
+    # ③ 没有 [settings] 段 → 末尾补一个（保证前面的最后一行以换行结尾）
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    lines.append("\n[settings]\napply_on_boot = true\n")
+open(p, "w", encoding="utf-8").write("".join(lines))
+PY
+}
+
 # 单次「写 + 重启」：★ 唯一一处落地动作，重试用同一个函数（不再复制粘贴）
 apply_once() {
+    # ★ 先停：daemon 运行时会保有自己的 modes/config 内存态，退出时可能把旧值刷回文件。
     if cc_detect_ctl; then
-        # 先停：某些 daemon 退出时会把内存里的旧 current_active_mode 刷回文件
-        cc_ctl_run stop >/dev/null 2>&1 && sleep 1
+        if ! cc_ctl_run stop >/dev/null 2>&1; then
+            warn "stop 未成功（继续，但写入可能被退出时的刷盘覆盖）"
+        fi
+        sleep 2          # 等 daemon 真正退出并完成落盘（1s 在慢盘上不够）
     fi
     cat "$TMP" > "$MODE_CONFIG"
     log "已设置 current_active_mode = ${MODE_UID}（档位 ${MODE_ARG}=${MODE_NAME}）"
@@ -350,16 +471,41 @@ if [ "$DRY_RUN" = "1" ]; then
     exit 0
 fi
 
+# ★★ 关键一步：确保 apply_on_boot=true，否则 daemon 启动【不会】应用 active mode，
+#    结果就是 modes.json 改了、config.toml 纹丝不动（正是"模式改了配置没变"）。
+if [ -f "$CONFIG_TOML" ]; then
+    if ensure_apply_on_boot; then
+        log "apply_on_boot = true 已确认（daemon 启动会应用当前 Mode）"
+    else
+        warn "无法确认/设置 apply_on_boot=true（config.toml 只读？）"
+    fi
+fi
+
 apply_once; RC=$?
-sleep 1
+sleep 2
 NOW="$(read_back)"
 
 # 回读不一致 → 再落地一次（daemon 版本差异可能把文件写回；只重试一次防死循环）
 if [ "$NOW" != "$MODE_UID" ] && [ "$RC" = "0" ]; then
     warn "回读值 ${NOW:-（空）} ≠ ${MODE_UID}（疑似被 daemon 重写）→ 重写并再重启一次"
     apply_once; RC=$?
-    sleep 1
+    sleep 2
     NOW="$(read_back)"
+fi
+
+# ★★ 第二重回读：config.toml 的真实设置是否已等于当前 Mode 的内容。
+#    这是「模式改了但配置没变」的直接判据 —— 只看 modes.json 是不够的。
+CFG_OK=2
+if [ -f "$CONFIG_TOML" ]; then
+    config_matches_mode; CFG_OK=$?
+    if [ "$CFG_OK" = "1" ]; then
+        warn "config.toml 与当前 Mode【不一致】⇒ 档位没真正落到配置"
+        warn "  ⇒ 强制再应用一次（stop → 写 → start）"
+        apply_once; RC=$?
+        sleep 2
+        NOW="$(read_back)"
+        config_matches_mode; CFG_OK=$?
+    fi
 fi
 rm -f "$TMP"
 
@@ -380,6 +526,13 @@ if [ "$NOW" != "$MODE_UID" ]; then
     warn "档位可能未生效（current_active_mode 被改回）。"
     warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync"
     exit 4
+fi
+if [ "$CFG_OK" = "1" ]; then
+    warn "★ current_active_mode 已是 ${MODE_UID}，但 config.toml 仍与 Mode 内容不符。"
+    warn "  可能：① apply_on_boot 仍非 true（daemon 未在启动时应用）"
+    warn "        ② Mode 的 all_device_settings 引用了 daemon 不认识的设备/通道"
+    warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync   # 看 ⑦ 环"
+    exit 5
 fi
 log "档位切换完成：${MODE_ARG}(${MODE_NAME}) → ${MODE_UID}"
 exit 0
