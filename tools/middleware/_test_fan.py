@@ -262,7 +262,7 @@ def main():
     old = os.environ.pop(mw.FAN_APPLY_CMD_ENV, None)
     old2 = os.environ.pop(mw.FAN_ATTR_PWM_ENV, None)
     try:
-        r = mw.apply_to_external_app(5, {"fan_mode": 4})
+        r = mw.apply_to_external_app({"fan_mode": 4})
         check("无配置 → 空实现返回 True", r is True, r)
     finally:
         if old is not None:
@@ -275,7 +275,7 @@ def main():
     os.close(fd)
     os.environ[mw.FAN_APPLY_CMD_ENV] = f"echo {{mode}} > {outp}"
     try:
-        r = mw.apply_to_external_app(5, {"fan_mode": 4})
+        r = mw.apply_to_external_app({"fan_mode": 4})
         check("外部命令返回 True", r is True, r)
         with open(outp, encoding="utf-8", errors="replace") as f:
             got = f.read().strip().strip("\r\n")
@@ -287,7 +287,7 @@ def main():
     # 外部命令失败 → 返回 False 且不抛
     os.environ[mw.FAN_APPLY_CMD_ENV] = "false"
     try:
-        r = mw.apply_to_external_app(5, {"fan_mode": 2})
+        r = mw.apply_to_external_app({"fan_mode": 2})
         check("外部命令失败 → False（不抛）", r is False, r)
     finally:
         os.environ.pop(mw.FAN_APPLY_CMD_ENV, None)
@@ -297,18 +297,18 @@ def main():
     os.close(fd2)
     os.environ[mw.FAN_ATTR_PWM_ENV] = pwmp
     try:
-        mw.apply_to_external_app(2, {"fan_mode": 4})
+        mw.apply_to_external_app({"fan_mode": 4})
         with open(pwmp, encoding="utf-8") as f:
             v = f.read().strip()
         check("sysfs PWM 写入 255（强劲）", v == "255", v)
-        mw.apply_to_external_app(3, {"fan_mode": 2})
+        mw.apply_to_external_app({"fan_mode": 2})
         with open(pwmp, encoding="utf-8") as f:
             v = f.read().strip()
         check("sysfs PWM 写入 64（低速）", v == "64", v)
         # 智能档不写 PWM
         with open(pwmp, "w") as f:
             f.write("SENTINEL")
-        mw.apply_to_external_app(3, {"fan_mode": 5})
+        mw.apply_to_external_app({"fan_mode": 5})
         with open(pwmp, encoding="utf-8") as f:
             v = f.read().strip()
         check("「智能」不写 PWM（保持原值）", v == "SENTINEL", v)
@@ -353,7 +353,7 @@ def main():
     os.environ[mw.FAN_COOLERCONTROL_ENV] = "1"
     os.environ[mw.FAN_COOLERCONTROL_SCRIPT_ENV] = fake_cc
     try:
-        r = mw.apply_to_external_app(5, {"fan_mode": 3})
+        r = mw.apply_to_external_app({"fan_mode": 3})
         check("CoolerControl 分支返回 True", r is True, r)
         got = ""
         if os.path.exists(argfile):
@@ -372,7 +372,7 @@ def main():
     os.environ[mw.FAN_COOLERCONTROL_ENV] = "1"
     os.environ[mw.FAN_COOLERCONTROL_SCRIPT_ENV] = fake_cc2
     try:
-        r = mw.apply_to_external_app(5, {"fan_mode": 4})
+        r = mw.apply_to_external_app({"fan_mode": 4})
         check("脚本 rc=7 → False（不抛）", r is False, r)
     finally:
         os.environ.pop(mw.FAN_COOLERCONTROL_ENV, None)
@@ -385,7 +385,7 @@ def main():
     os.environ[mw.FAN_COOLERCONTROL_ENV] = "1"
     os.environ[mw.FAN_COOLERCONTROL_SCRIPT_ENV] = "/nonexistent/apply-mode.sh"
     try:
-        r = mw.apply_to_external_app(5, {"fan_mode": 4})
+        r = mw.apply_to_external_app({"fan_mode": 4})
         check("启用但脚本缺失 → False（不抛）", r is False, r)
     finally:
         os.environ.pop(mw.FAN_COOLERCONTROL_ENV, None)
@@ -400,7 +400,7 @@ def main():
     os.environ[mw.FAN_COOLERCONTROL_SCRIPT_ENV] = fake_cc3
     os.environ[mw.FAN_APPLY_CMD_ENV] = "true"
     try:
-        r = mw.apply_to_external_app(5, {"fan_mode": 2})
+        r = mw.apply_to_external_app({"fan_mode": 2})
         check("优先级：显式 CMD 生效", r is True, r)
         check("优先级：CoolerControl 未被调用",
               not os.path.exists(pref_out) or
@@ -424,7 +424,7 @@ def main():
     os.environ[mw.FAN_COOLERCONTROL_SCRIPT_ENV] = fake_cc4
     os.environ[mw.FAN_ATTR_PWM_ENV] = pw_out
     try:
-        mw.apply_to_external_app(5, {"fan_mode": 4})
+        mw.apply_to_external_app({"fan_mode": 4})
         with open(pw_out, encoding="utf-8") as f:
             v = f.read().strip()
         check("优先级：CoolerControl 压过 sysfs PWM（PWM 未被写）",
@@ -517,6 +517,13 @@ def main():
               mw._cc_current_fan_mode() == 2, mw._cc_current_fan_mode())
 
         # ── FanState.mode() 会把 CC 侧的值同步回本地（屏幕回显跟着变）──
+        #   ★ 先清掉上一步的 --bind（tier2→U_MINE）。显式绑定是权威的：一旦
+        #     档位 2 被绑给 U_MINE，名字带「低速」的 U_LOW 就不再被认成档位 2
+        #     （这是设计如此，避免两档抢同一个 Mode）。本子用例要验证的是
+        #     「按名字同步」，所以必须先解除绑定。
+        if os.path.exists(_map_p):
+            os.remove(_map_p)
+            os.utime(_modes_p, (time.time() + 1, time.time() + 1))
         _write_modes(U_LOW)
         mw._CC_REV_CACHE["sig"] = None
         st8, p8 = make_state()
@@ -575,14 +582,20 @@ def main():
     _saved_env2 = (os.environ.get("HIKSEMI_FAN_COOLERCONTROL"),
                    os.environ.get(mw.CC_MODE_CONFIG_ENV),
                    os.environ.get(mw.CC_FAN_MODE_MAP_ENV),
-                   os.environ.get(mw.CC_SELF_WRITE_ENV))
+                   os.environ.get(mw.CC_FAN_TIER_PY_ENV))
+    # fan-tier.py 加载缓存（用真实模块；测试里显式指到仓库路径）
+    _tier_p = os.path.join(os.path.dirname(os.path.abspath(mw.__file__)),
+                           "..", "coolercontrol", "fan-tier.py")
+    _tier_p = os.path.abspath(_tier_p)
     try:
         os.environ["HIKSEMI_FAN_COOLERCONTROL"] = "1"
         os.environ[mw.CC_MODE_CONFIG_ENV] = _modes_p2
         os.environ[mw.CC_FAN_MODE_MAP_ENV] = _map_p2
+        os.environ[mw.CC_FAN_TIER_PY_ENV] = _tier_p
+        mw._CC_TIER_CACHE = False          # 强制按新路径重新加载
         mw._CC_REV_CACHE["sig"] = None
-        mw._CC_SELF_WRITE["mode"] = None
-        mw._CC_SELF_WRITE["until"] = 0.0
+
+        check("fan-tier 规则模块可被加载", mw._cc_tier_module() is not None)
 
         st9, p9 = make_state()
         try:
@@ -592,64 +605,72 @@ def main():
             mw._CC_REV_CACHE["sig"] = None
             check("起始态：屏幕=3 与 CC=标准 一致", st9.mode() == 3, st9.mode())
 
-            # ★ 模拟「屏幕切到低速」：update(2) → 打自写标记 → 外部把
-            #   modes.json 写成低速（apply-mode.sh 的行为）
+            # ★ 核心：屏幕切到低速 —— update() 会先把本地改成 2 并落地
+            #   （真机上 apply-mode.sh 随后把 modes.json 写成低速）
             st9.update(2)
             check("update(2) 后本地状态=2", st9.get()["fan_mode"] == 2,
                   st9.get()["fan_mode"])
-            check("update(2) 已打自写标记",
-                  mw._CC_SELF_WRITE["mode"] == 2,
-                  mw._CC_SELF_WRITE["mode"])
-            check("自写窗口已开启", mw._cc_in_self_write_window())
-
-            _write_modes2(_U_LOW2)          # apply-mode.sh 写文件
+            _write_modes2(_U_LOW2)              # apply-mode.sh 写文件的效果
             mw._CC_REV_CACHE["sig"] = None
-            # ★ 关键断言：窗口内反向同步读到 2 == 自写目标 ⇒ 不得回滚
-            check("★ 自写窗口内：mode() 保持 2（不被弹回 3）",
+            # ★ 关键断言：CC 读回 2 == 本地 2 ⇒ ext != cur 不成立 ⇒ 不回滚
+            check("★ 屏幕切低速后：mode() 保持 2（不被弹回 3）",
                   st9.mode() == 2, st9.mode())
-            check("★ 自写窗口内：本地状态仍为 2",
-                  st9.get()["fan_mode"] == 2, st9.get()["fan_mode"])
+            check("★ 本地状态仍为 2", st9.get()["fan_mode"] == 2,
+                  st9.get()["fan_mode"])
+            check("★ 反复读也不回滚（10 次状态帧）",
+                  all(st9.mode() == 2 for _ in range(10)))
 
-            # ★ 对照：窗口过期后，用户真的在 CC UI 手动切了 → 必须同步
-            mw._CC_SELF_WRITE["until"] = 0.0        # 强制窗口过期
-            _write_modes2(_U_STD2)                  # 用户在 CC 切回标准
+            # ★ 对照：用户在 CC UI 手动切回标准 → 必须同步
+            _write_modes2(_U_STD2)
             mw._CC_REV_CACHE["sig"] = None
-            check("窗口过期后：CC 手动切回标准 → 屏幕跟上 =3",
-                  st9.mode() == 3, st9.mode())
+            check("CC 手动切回标准 → 屏幕跟上 =3", st9.mode() == 3, st9.mode())
 
-            # ★ 边界：窗口开着但 CC 切到了【另一个】档 → 是真外部操作，要同步
-            st9.update(2)                           # 屏幕切低速（打标记）
-            check("再次切档：标记=2", mw._CC_SELF_WRITE["mode"] == 2,
-                  mw._CC_SELF_WRITE["mode"])
+            # ★ 边界：CC 切到第三个档（本地没有的）也要同步
+            st9.update(4)                       # 屏幕切强劲
+            _write_modes2(_U_LOW2)              # CC 侧却是低速
             mw._CC_REV_CACHE["sig"] = None
-            _write_modes2(_U_STD2)                  # 但 CC 侧是标准（≠目标）
-            mw._CC_REV_CACHE["sig"] = None
-            check("窗口内但读到≠目标值 → 判定为外部切换，同步为 3",
-                  st9.mode() == 3, st9.mode())
+            check("CC 侧与本地不同 → 判为外部切换，同步为 2",
+                  st9.mode() == 2, st9.mode())
 
-            # 窗口秒数可用环境变量覆盖
-            os.environ[mw.CC_SELF_WRITE_ENV] = "0"
-            check("窗口秒数可被 HIKSEMI_FAN_CC_SELF_WRITE_SEC 覆盖为 0",
-                  mw._cc_self_write_window() == 0.0, mw._cc_self_write_window())
-            os.environ.pop(mw.CC_SELF_WRITE_ENV, None)
-            check("不设环境变量时用默认 12s",
-                  mw._cc_self_write_window() == mw.CC_SELF_WRITE_WINDOW,
-                  mw._cc_self_write_window())
+            # ★ 机制简化验证：自写标记机制已【整体删除】（不再有写-读耦合）
+            check("已无 _CC_SELF_WRITE 自写标记（彻底删除）",
+                  not hasattr(mw, "_CC_SELF_WRITE"))
+            check("已无 _cc_mark_self_write API（彻底删除）",
+                  not hasattr(mw, "_cc_mark_self_write"))
+            check("已无 _cc_self_write_window API（简化完成）",
+                  not hasattr(mw, "_cc_self_write_window"))
+            check("已无 _cc_in_self_write_window API（简化完成）",
+                  not hasattr(mw, "_cc_in_self_write_window"))
+            check("已无 HIKSEMI_FAN_CC_SELF_WRITE_SEC 环境变量常量",
+                  not hasattr(mw, "CC_SELF_WRITE_ENV"))
         finally:
             if os.path.exists(p9):
                 os.remove(p9)
     finally:
         for k, v in zip(("HIKSEMI_FAN_COOLERCONTROL",
                          mw.CC_MODE_CONFIG_ENV, mw.CC_FAN_MODE_MAP_ENV,
-                         mw.CC_SELF_WRITE_ENV), _saved_env2):
+                         mw.CC_FAN_TIER_PY_ENV), _saved_env2):
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
         mw._CC_REV_CACHE["sig"] = None
-        mw._CC_SELF_WRITE["mode"] = None
-        mw._CC_SELF_WRITE["until"] = 0.0
+        mw._CC_TIER_CACHE = False
         _sh2.rmtree(_ccdir2, ignore_errors=True)
+
+    # ── 18. 档位规则唯一来源（fan-tier.py）───────────────────────────────
+    print("\n【18】档位规则唯一来源：无重复常量、无重复实现")
+    check("中间件不再自带默认 uid 表（CC_DEFAULT_MODE_UIDS 已删）",
+          not hasattr(mw, "CC_DEFAULT_MODE_UIDS"))
+    check("中间件不再自带关键词表（CC_MODE_NAME_KEYS 已删）",
+          not hasattr(mw, "CC_MODE_NAME_KEYS"))
+    check("反转档位走 fan-tier（_cc_tier_module 存在）",
+          callable(getattr(mw, "_cc_tier_module", None)))
+    # apply_to_external_app 不再有死参数 prev_mode
+    import inspect as _insp
+    _sig = _insp.signature(mw.apply_to_external_app)
+    check("apply_to_external_app 已删除未使用的 prev_mode 参数",
+          list(_sig.parameters) == ["state"], list(_sig.parameters))
 
     # ── 16. 版本号 ──
     print("\n【16】版本号已递增")

@@ -531,7 +531,7 @@ fan4 = { disabled = true }
     ok("sync ④ 查重启通道（改完要有人重启 daemon）", "重启通道" in ptxt)
     ok("sync ⑤ 查中间件是否已重启（新代码跑了没）", "中间件是否已重启" in ptxt)
     ok("sync ⑥ 查自我回滚防护（屏幕切档弹回的根因）",
-       "自我回滚防护" in ptxt and "_cc_mark_self_write" in ptxt)
+       "自我回滚防护" in ptxt and "_cc_current_fan_mode" in ptxt)
     ok("sync 提示重跑安装器即可同步（不再是 cp -rn 永不覆盖）",
        "内容比对同步" in ptxt or "cp -f" in ptxt)
 

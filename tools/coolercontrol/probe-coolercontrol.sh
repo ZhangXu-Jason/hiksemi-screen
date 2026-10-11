@@ -75,8 +75,8 @@ fi
 #     ① 工具是不是新版（旧脚本 = 修了也没用）
 #     ② 档位能不能解析出 Mode（绑定）
 #     ③ 改完配置有没有人去重启 daemon（重启通道存在吗）
-#     ④ 中间件有没有重启（反向同步是新代码，跑着旧进程就不会生效）
-#     ⑤ 中间件是否已重启（反向同步是新代码，跑旧进程就不生效）
+#     ④ 改完配置有没有人去重启 daemon（重启通道存在吗）
+#     ⑤ 中间件有没有重启（反向同步是新代码，跑着旧进程就不会生效）
 #     ⑥ 自我回滚防护（★ 屏幕切档后自己弹回去的根因）
 if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     CC_DIR="${CC_DIR:-/etc/coolercontrol}"
@@ -189,31 +189,30 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
         fi
     fi
 
-    SEC "⑥ 自我回滚防护（★ 屏幕切档后自己弹回去的根因）"
+    SEC "⑥ 反向同步与自我回滚防护（★ 屏幕切档后自己弹回去的根因）"
     MW="$(dirname "$HERE")/middleware/middleware.py"
+    TIER="$HERE/fan-tier.py"
     if [ ! -f "$MW" ]; then
         INFO "找不到 middleware.py，跳过"
     else
-        if grep -q "_cc_mark_self_write" "$MW" 2>/dev/null; then
-            OK "中间件已含自我回滚防护（_cc_mark_self_write）"
+        # ★ 现在反向同步的规则来自 fan-tier.py；中间件只负责"读回值 != 本地值才同步"
+        if grep -q "_cc_current_fan_mode" "$MW" 2>/dev/null && \
+           grep -q "ext != cur" "$MW" 2>/dev/null; then
+            OK "反向同步已就位（读回值 ≠ 本地值才同步 ⇒ 天然不会自我回滚）"
         else
-            NG "中间件【缺】自我回滚防护 ⇒ 屏幕切档后会被反向同步弹回原档"
-            NG "  症状：屏幕变一下、1~3 秒后又变回去；probe ③ 环永远不变"
+            NG "中间件【缺】反向同步/回滚防护 ⇒ 屏幕切档可能被弹回原档"
             INFO "修：同步新版 middleware.py 并重启："
             INFO "    sudo bash $(dirname "$HERE")/install-autostart.sh --fan-coolercontrol on"
             INFO "    sudo systemctl restart hiksemi-sub"
         fi
-        if grep -q "_cc_in_self_write_window" "$MW" 2>/dev/null; then
-            OK "自写窗口判定已就位（读到刚下发的档位不回滚）"
-        fi
-        # 窗口秒数（可调）
-        SVC=/etc/systemd/system/hiksemi-sub.service
-        if [ -f "$SVC" ] && grep -q "HIKSEMI_FAN_CC_SELF_WRITE_SEC" "$SVC"; then
-            INFO "自写窗口已自定义: $(grep -o 'HIKSEMI_FAN_CC_SELF_WRITE_SEC=[^ ]*' "$SVC" | head -1)"
+        if [ -f "$TIER" ]; then
+            OK "档位规则模块 fan-tier.py 已就位（唯一权威来源）"
         else
-            INFO "自写窗口 = 默认 12s（够覆盖 daemon 重启；一般无需改）"
+            NG "缺少 fan-tier.py ⇒ 中间件反向同步会关闭（屏幕回显只跟本地状态）"
+            INFO "修：重跑安装器同步 tools/coolercontrol/"
         fi
         # ★ 反向同步是否真的在读 modes.json（中间件启用态）
+        SVC=/etc/systemd/system/hiksemi-sub.service
         if [ -f "$SVC" ] && grep -q 'HIKSEMI_FAN_COOLERCONTROL=1' "$SVC"; then
             OK "反向同步已启用（HIKSEMI_FAN_COOLERCONTROL=1）"
         fi
@@ -229,7 +228,7 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     INFO "  · ③ 有 NG        → 反向档位识别不出，需 --bind"
     INFO "  · ④ 有 NG        → 重启通道缺失，切档只写文件不生效"
     INFO "  · ⑤ 有 NG        → 改了中间件没重启"
-    INFO "  · ⑥ 有 NG        → 中间件缺自我回滚防护 ⇒ 屏幕切档会自己弹回（本次修复项）"
+    INFO "  · ⑥ 有 NG        → 反向同步/规则模块缺失 ⇒ 屏幕切档会自己弹回"
     exit 0
 fi
 

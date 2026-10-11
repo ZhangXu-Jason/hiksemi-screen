@@ -121,12 +121,22 @@ HOST_PRESETS = {
 # 保留 uid（daemon 会自动补写，这里只用于校验提示）
 BASE_PROFILES = ("0", "hs-low", "hs-standard", "hs-high")
 
-# ── 档位 ↔ Mode 绑定（★ 必须与同目录 fan-mode-map.py 完全一致）───────────────
+# ── 档位 ↔ Mode 绑定 ────────────────────────────────────────────────────────
 #   5=智能 / 2=低速 / 3=标准 / 4=强劲（与小彩屏 UI 的 fan_mode 一致）
-FAN_MODE_ORDER = (5, 2, 3, 4)
-DEFAULT_UIDS = {5: "hs-smart", 2: "hs-low", 3: "hs-standard", 4: "hs-high"}
+#   ★ 常量与名字认领规则统一来自同目录 fan-tier.py（唯一权威），本文件不另存副本。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import importlib.util as _ilu   # noqa: E402
+
+_ft_spec = _ilu.spec_from_file_location("fan_tier", os.path.join(_HERE, "fan-tier.py"))
+FT = _ilu.module_from_spec(_ft_spec)
+_ft_spec.loader.exec_module(FT)
+
+FAN_MODE_ORDER = FT.FAN_MODE_ORDER
+DEFAULT_UIDS = FT.DEFAULT_UIDS
 # 映射文件随渲染产物一起写出；屏幕切档与「CC→屏幕」反向同步都读它
-MAP_FILENAME = "hs-fan-mode-map.json"
+MAP_FILENAME = FT.MAP_FILENAME
 
 
 def die(msg):
@@ -455,17 +465,7 @@ def validate_modes(obj, expect_uids=("hs-smart", "hs-low", "hs-standard", "hs-hi
 #   只把内容（通道 / profile / 转速）换成渲染结果 ⇒ 内容正确 + UI 模式不丢。
 TIER_PROFILE = {5: "hs-smart", 2: "hs-low", 3: "hs-standard", 4: "hs-high"}
 TIER_LABEL = {5: "智能", 2: "低速", 3: "标准", 4: "强劲"}
-TIER_KEYS = {
-    5: ("hs 智能", "智能", "smart", "auto", "自动"),
-    2: ("hs 低速", "低速", "low", "静音", "quiet", "silent"),
-    3: ("hs 标准", "标准", "standard", "normal", "medium", "常规"),
-    4: ("hs 强劲", "强劲", "high", "full", "性能", "max", "turbo"),
-}
 HEX64 = re.compile(r"[0-9a-f]{64}")
-
-
-def _nname(s):
-    return re.sub(r"\s+", "", str(s or "")).lower()
 
 
 def _mode_profiles(mode):
@@ -481,20 +481,11 @@ def _mode_profiles(mode):
 
 
 def _tier_by_name(mode, claimed):
-    """按 Mode 名字认领档位（前缀优先，其次关键词）。认不出返回 None。"""
-    name = _nname(mode.get("name"))
-    if not name:
-        return None
-    for tier in FAN_MODE_ORDER:                 # 前缀优先（"hs 低速…"）
-        if tier not in claimed and _nname(TIER_KEYS[tier][0]) in name:
-            return tier
-    for tier in FAN_MODE_ORDER:                 # 再退到关键词
-        if tier in claimed:
-            continue
-        for key in TIER_KEYS[tier][1:]:
-            if _nname(key) in name:
-                return tier
-    return None
+    """按 Mode 名字认领档位（前缀优先，其次关键词）。认不出返回 None。
+
+    ★ 规则委托 fan-tier.py（唯一权威），与 middleware / fan-mode-map.py 完全同源。
+    """
+    return FT.tier_by_name(mode.get("name"), claimed)
 
 
 def _tier_by_content(mode, claimed):
@@ -692,15 +683,6 @@ def main():
     # ★ 用 None 区分「未传参」与「显式传空串」：
     #   None  → 允许 --host 预设填充
     #   ""    → 用户显式清空，预设不得覆盖
-    case_temp_name = "" if args.case_temp_name == "" else (
-        args.case_temp_name or "")
-    case_temp_uid = "" if args.case_temp_device_uid == "" else (
-        args.case_temp_device_uid or "")
-
-    # ★ 预设填充：--host 给出的值只在用户【未显式提供】该参数时生效，
-    #   命令行显式参数优先级更高（便于临时覆盖单个字段）。
-    # ★ 用 None 区分「未传参」与「显式传空串」：
-    #   None → 允许 --host 预设填充； "" → 用户显式清空，预设不得覆盖
     case_temp_name = args.case_temp_name
     case_temp_uid = args.case_temp_device_uid
 

@@ -59,7 +59,7 @@ DEFAULT_KEY = os.path.join(BASE, "key.pem")
 
 # ★ 版本号：每次有行为变更就递增。日志启动段会打印，
 #   用于判断「真机上跑的是哪一版」——排查"改了没生效"时第一眼就看它。
-MIDDLEWARE_VERSION = "2026.10.11-a（散热风扇：CoolerControl 双向同步 + 自我回滚防护）"
+MIDDLEWARE_VERSION = "2026.10.11-b（散热风扇：CoolerControl 双向同步 + 无标记防自我回滚）"
 
 
 def _code_fingerprint():
@@ -1623,24 +1623,18 @@ FAN_COOLERCONTROL_SCRIPT_ENV = "HIKSEMI_FAN_COOLERCONTROL_SCRIPT"
 #   用户在 CoolerControl Web UI 里手动激活了别的 Mode 时，小屏回显必须跟上，
 #   否则就出现「屏幕显示智能、实际跑的是强劲」的不同步。
 #   路径可用环境变量覆盖（与 tools/coolercontrol/fan-mode-map.py 完全一致）：
-#     CC_MODE_CONFIG   modes.json
-#     CC_FAN_MODE_MAP  档位映射文件（默认与 modes.json 同目录）
+#     CC_MODE_CONFIG     modes.json
+#     CC_FAN_MODE_MAP    档位映射文件（默认与 modes.json 同目录）
+#     HIKSEMI_FAN_TIER_PY  档位规则模块 fan-tier.py（默认按 apply-mode.sh 同目录找）
+#   ★★ 档位解析规则（默认 uid / 名字前缀 / 关键词 / 优先级）**不在这里实现**，
+#      统一委托 fan-tier.py —— 那是中间件、fan-mode-map.py、render-config.py
+#      三方共用的唯一权威来源（历史教训：各写一份且顺序不一致 ⇒ 同一台机器
+#      上「屏幕显示 A、CC 实际 B」）。
 CC_MODE_CONFIG_ENV = "CC_MODE_CONFIG"
 CC_FAN_MODE_MAP_ENV = "CC_FAN_MODE_MAP"
+CC_FAN_TIER_PY_ENV = "HIKSEMI_FAN_TIER_PY"
 CC_MODES_DEFAULT = "/etc/coolercontrol/modes.json"
 CC_MAP_FILENAME = "hs-fan-mode-map.json"
-# ★ 自写抑制窗口秒数（默认 12）；排障可调小/调 0 关闭该机制
-CC_SELF_WRITE_ENV = "HIKSEMI_FAN_CC_SELF_WRITE_SEC"
-# 渲染器产出的默认 uid（★ 必须与 fan-mode-map.py 的 DEFAULT_UIDS 一致）
-CC_DEFAULT_MODE_UIDS = {5: "hs-smart", 2: "hs-low",
-                        3: "hs-standard", 4: "hs-high"}
-# 名字关键词兜底（用户自建 Mode 时的自动认领规则）
-CC_MODE_NAME_KEYS = {
-    5: ("hs 智能", "智能", "smart", "auto", "自动"),
-    2: ("hs 低速", "低速", "low", "静音", "quiet", "silent"),
-    3: ("hs 标准", "标准", "standard", "normal", "medium", "常规"),
-    4: ("hs 强劲", "强劲", "high", "full", "性能", "max", "turbo"),
-}
 #   也可直接指定 sysfs PWM 节点（兜底）：写入按档位换算后的 PWM 值
 FAN_ATTR_PWM_ENV = "HIKSEMI_FAN_PWM_PATH"
 
@@ -1742,6 +1736,12 @@ class FanState:
           否则会出现「屏幕显示智能、实际跑的是强劲」的不同步。
           ★ 这里【绝不】触发 apply_to_external_app()，否则会写回 modes.json
             并重启 daemon，形成"屏幕←→CC"互相改的死循环。
+
+        ★★ 自我回滚防护：只有当读回的 CC 档位**不同于本地已存档位**时才同步。
+          屏幕切档 → update() 先把本地改成新档 → 再写 CC；此后状态帧读回 CC
+          拿到的必然是同一个新档 ⇒ `ext == cur` ⇒ 直接返回，**天然不会回滚**。
+          （反过来说：任何"CC 值覆盖本地"都只在两者确实不同、即用户真的在
+            CC UI 手动切了档时才发生。这是本机制的充要条件。）
         """
         if sync_external:
             ext = _cc_current_fan_mode()
@@ -1749,21 +1749,12 @@ class FanState:
                 with self._lock:
                     cur = int(self._data.get("fan_mode", FAN_MODE_DEFAULT))
                     if ext != cur:
-                        # ★★ 关键：区分【自己刚写的】与【用户在 CC UI 手切的】
-                        #   若正处于自写窗口内且读回值 == 我们刚下发的目标档位，
-                        #   说明这是「屏幕切档 → apply → daemon 重写 modes.json」
-                        #   的余波，【绝不能】拿它覆盖本地状态（否则自我回滚）。
-                        sw = _CC_SELF_WRITE["mode"]
-                        if sw is not None and ext == sw and _cc_in_self_write_window():
-                            log(f"[fan] 反向同步跳过（自写窗口内读到刚下发的 "
-                                f"{ext}，非外部切换）", level="debug")
-                        else:
-                            self._data["fan_mode"] = ext
-                            self._save_locked()
-                            log(f"[fan] 检测到 CoolerControl 侧手动切换："
-                                f"{cur}（{FAN_MODES.get(cur, '?')}）→ "
-                                f"{ext}（{FAN_MODES.get(ext, '?')}），小屏回显已同步",
-                                level="quiet")
+                        self._data["fan_mode"] = ext
+                        self._save_locked()
+                        log(f"[fan] 检测到 CoolerControl 侧手动切换："
+                            f"{cur}（{FAN_MODES.get(cur, '?')}）→ "
+                            f"{ext}（{FAN_MODES.get(ext, '?')}），小屏回显已同步",
+                            level="quiet")
         return int(self.get().get("fan_mode", FAN_MODE_DEFAULT))
 
     def update(self, fan_mode):
@@ -1777,13 +1768,10 @@ class FanState:
         log(f"[fan] 档位已保存 fan_mode={new_mode}"
             f"（{FAN_MODES.get(new_mode, '未知')}）"
             f"{'（未变化）' if prev == new_mode else f'（原 {prev}）'}", level="quiet")
-        # ★★ 自我回滚防护：在触发外部落地【之前】先打上自写标记，
-        #   这样 apply-mode.sh 写 modes.json、daemon 重启期间/
-        #   之后的状态帧反向同步读到目标档位时，会判定为"自己写的"而不回滚。
-        if _coolercontrol_enabled():
-            _cc_mark_self_write(new_mode)
-        # ★ 外部应用落地（无论是否变化都重放一次，保证与系统一致）
-        apply_to_external_app(prev, state)
+        # ★ 外部应用落地（无论是否变化都重放一次，保证与系统一致）。
+        #   落地后 CC 的 current_active_mode 会变成 new_mode，与本地一致 ⇒
+        #   反向同步读到相同值、不会覆盖（自我回滚自然被挡住，无需额外标记）。
+        apply_to_external_app(state)
         return state, prev != new_mode
 
 
@@ -1807,38 +1795,6 @@ def _coolercontrol_enabled():
 # mtime 缓存：状态帧每秒都会调，只在文件真变了才重新解析
 _CC_REV_CACHE = {"sig": None, "mode": None}
 
-# ★★ 自写抑制窗口：避免「屏幕切档 → 写 modes.json → 反向同步读回刚写的值
-#   → 认为 CC 侧手动切换 → 把我们的改动当成外部改动」这条自我回滚链。
-#   （症状：屏幕切到低速后自己弹回标准，probe ③ 环永远不变）
-#   机制：update() 写 modes.json 前先记录「本次要落地的目标档位」，随后在一段
-#   时间窗内，反向同步读到与目标一致的值就直接判定为"自己刚写的"、不再改写本地
-#   状态；读到【不同】的值才认为是用户在 CC UI 手动切的，允许同步。
-#   ★ 不用"忽略一次写入"的计数法（客户端可能连点、状态帧每秒来，次数极难对齐），
-#     时间窗更稳；窗口 = 单帧轮询间隔(2s) 的若干倍，覆盖 apply-mode.sh 重启 daemon
-#     后 modes.json 被 daemon 重写的整个窗口（实测 3~8s）。
-_CC_SELF_WRITE = {"mode": None, "until": 0.0}
-CC_SELF_WRITE_WINDOW = 12.0        # 秒；可用环境变量调，见 HIKSEMI_FAN_CC_SELF_WRITE_SEC
-
-
-def _cc_self_write_window():
-    v = os.environ.get(CC_SELF_WRITE_ENV, "").strip()
-    if v:
-        try:
-            return max(0.0, float(v))
-        except ValueError:
-            pass
-    return CC_SELF_WRITE_WINDOW
-
-
-def _cc_mark_self_write(mode):
-    """记录「本进程中刚把 modes.json 写成 mode」，供反向同步判定自我回滚。"""
-    _CC_SELF_WRITE["mode"] = int(mode)
-    _CC_SELF_WRITE["until"] = time.time() + _cc_self_write_window()
-
-
-def _cc_in_self_write_window():
-    return time.time() < _CC_SELF_WRITE["until"]
-
 
 def _cc_paths():
     mp = os.environ.get(CC_MODE_CONFIG_ENV, "").strip() or CC_MODES_DEFAULT
@@ -1847,17 +1803,50 @@ def _cc_paths():
     return mp, mf
 
 
-def _cc_norm(s):
-    return re.sub(r"\s+", "", str(s or "")).lower()
+def _cc_tier_module():
+    """惰性加载 tools/coolercontrol/fan-tier.py —— 档位规则唯一权威来源。
+
+    加载失败返回 None（此时反向同步退化为"不做"，绝不乱猜）。
+    路径可用 HIKSEMI_FAN_TIER_PY 覆盖（测试注入用）。
+    """
+    global _CC_TIER_CACHE
+    if _CC_TIER_CACHE is not False:
+        return _CC_TIER_CACHE or None
+    cand = [os.environ.get(CC_FAN_TIER_PY_ENV, "").strip()]
+    cand += [os.path.join(os.path.dirname(p), "fan-tier.py")
+             for p in FAN_COOLERCONTROL_SCRIPT_CANDIDATES]
+    for p in cand:
+        if p and os.path.isfile(p):
+            try:
+                import importlib.util as _ilu
+                spec = _ilu.spec_from_file_location("fan_tier", p)
+                mod = _ilu.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                _CC_TIER_CACHE = mod
+                log(f"[fan] 档位规则加载自 {p}", level="debug")
+                return mod
+            except Exception as e:
+                log(f"[fan] ⚠ 加载 fan-tier.py 失败（{p}）: {e}", level="debug")
+    _CC_TIER_CACHE = False
+    log("[fan] ⚠ 未找到 fan-tier.py ⇒ 反向同步关闭（屏幕回显只跟本地状态）",
+        level="quiet")
+    return None
+
+
+_CC_TIER_CACHE = False
 
 
 def _cc_current_fan_mode():
     """★ 读 CoolerControl 当前激活的 Mode，反查成屏幕档位（5/2/3/4）。
 
     返回 None = 识别不出（Mode 名字不含档位关键词且没做 --bind）→ 保持本地状态。
-    解析优先级：映射文件 → 默认 uid → 名字关键词（与 fan-mode-map.py 一致）。
+    ★ 解析规则**不在本文件实现**，统一委托 fan-tier.py（唯一权威，与
+      fan-mode-map.py / render-config.py 共用，杜绝规则漂移）。
     """
     if not _coolercontrol_enabled():
+        return None
+    ft = _cc_tier_module()
+    if ft is None:
         return None
     modes_p, map_p = _cc_paths()
     try:
@@ -1873,46 +1862,8 @@ def _cc_current_fan_mode():
         with open(modes_p, encoding="utf-8") as f:
             d = json.load(f)
         cur = d.get("current_active_mode")
-        by_uid = {m.get("uid"): m for m in (d.get("modes") or [])
-                  if isinstance(m, dict)}
-
-        # ① 映射文件（--bind 写入的显式绑定）
-        mapping = {}
-        if os.path.exists(map_p):
-            try:
-                with open(map_p, encoding="utf-8") as f:
-                    mm = json.load(f)
-                if isinstance(mm, dict):
-                    for k, v in mm.items():
-                        try:
-                            mapping[int(k)] = str(v).strip()
-                        except (TypeError, ValueError):
-                            continue
-            except Exception:
-                pass
-        for k, v in mapping.items():
-            if v == cur:
-                mode = k
-                break
-
-        # ② 默认 uid
-        if mode is None:
-            for k, u in CC_DEFAULT_MODE_UIDS.items():
-                if u == cur:
-                    mode = k
-                    break
-
-        # ③ 名字认领（前缀 → 关键词）
-        if mode is None:
-            name = _cc_norm((by_uid.get(cur) or {}).get("name"))
-            for m_ in FAN_MODE_ORDER:
-                for key in CC_MODE_NAME_KEYS.get(m_, ()):
-                    k = _cc_norm(key)
-                    if k and (name.startswith(k) or k in name):
-                        mode = m_
-                        break
-                if mode is not None:
-                    break
+        binding = ft.load_binding(modes_p)
+        mode = ft.reverse(cur, d, binding=binding)
     except Exception as e:
         log(f"[fan] ⚠ 读 CoolerControl 当前 Mode 失败: {e}", level="debug")
         mode = None
@@ -1922,7 +1873,7 @@ def _cc_current_fan_mode():
     return mode
 
 
-def apply_to_external_app(prev_mode, state):
+def apply_to_external_app(state):
     """★ 把风扇档位落地到【外部应用 / 系统】的钩子。
 
     按优先级尝试，全部不可用时安全退化为「仅应用级状态」：

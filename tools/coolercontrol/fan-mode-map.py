@@ -17,12 +17,12 @@ fan-mode-map.py —— 【档位 ↔ CoolerControl Mode】映射解析器
 本模块把「档位 → 哪个 Mode」这件事【外置成可配置的映射】，并且即使不配置，
 也能按 Mode 名字自动认领，做到「用户随便建、随便改名，屏幕照样能切」。
 
-映射来源（优先级从高到低）
+映射来源（优先级从高到低）—— ★ 规则实现在 fan-tier.py（唯一权威），本文件只做包装
 -----------------------------------------------------------------------------
   1) 映射文件 / 环境变量里的【显式绑定】（值可以是 uid，也可以是 Mode 名字）
   2) 默认 uid：hs-smart / hs-low / hs-standard / hs-high（渲染器产出的那套）
-  3) 名字前缀：  "hs 智能…" / "hs 低速…" / "hs 标准…" / "hs 强劲…"
-  4) 名字包含关键词：智能|smart / 低速|low / 标准|standard / 强劲|high|性能
+  3) 名字前缀轮：  "hs 智能…" / "hs 低速…" / "hs 标准…" / "hs 强劲…"
+  4) 名字关键词轮：智能|smart / 低速|low / 标准|standard / 强劲|high|性能
 
 反向（CoolerControl → 屏幕）同理，用于让屏幕回显跟上 UI 里的手动切换。
 
@@ -41,72 +41,31 @@ fan-mode-map.py —— 【档位 ↔ CoolerControl Mode】映射解析器
 
 import json
 import os
-import re
 import sys
 
-# ── 四档常量（与中间件 FAN_MODES 保持一致）──────────────────────────────────
-FAN_MODES = {5: "智能", 2: "低速", 3: "标准", 4: "强劲"}
-FAN_MODE_ORDER = (5, 2, 3, 4)
+# ★★ 规则唯一来源：同目录的 fan-tier.py（文件名含连字符，须用 importlib 加载）。
+#   本文件只负责「读文件 + 命令行包装 + 渲染诊断」，不再自己实现一套解析规则
+#   （历史上这里与中间件各写一份、且匹配顺序不一致，会导致同一台机器上
+#    「屏幕显示 A、CC 实际 B」）。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import importlib.util as _ilu   # noqa: E402
 
-# ① 渲染器产出的默认 uid
-DEFAULT_UIDS = {5: "hs-smart", 2: "hs-low", 3: "hs-standard", 4: "hs-high"}
-# ② 旧版名字前缀（用户在 UI 里照抄我们模板名建的 Mode）
-NAME_PREFIX = {5: "hs 智能", 2: "hs 低速", 3: "hs 标准", 4: "hs 强劲"}
-# ③ 名字关键词兜底（用户起了自己的名字，比如「静音」「性能」）
-NAME_KEYS = {
-    5: ("智能", "smart", "auto", "自动"),
-    2: ("低速", "low", "静音", "quiet", "silent"),
-    3: ("标准", "standard", "normal", "medium", "常规"),
-    4: ("强劲", "high", "full", "性能", "max", "turbo"),
-}
+_spec = _ilu.spec_from_file_location("fan_tier", os.path.join(_HERE, "fan-tier.py"))
+FT = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(FT)
 
-MODES_DEFAULT = "/etc/coolercontrol/modes.json"
-MAP_FILENAME = "hs-fan-mode-map.json"
+FAN_MODES = FT.FAN_MODES
+FAN_MODE_ORDER = FT.FAN_MODE_ORDER
+DEFAULT_UIDS = FT.DEFAULT_UIDS
+NAME_PREFIX = FT.NAME_PREFIX
+NAME_KEYS = FT.NAME_KEYS
+MODES_DEFAULT = FT.MODES_DEFAULT
+MAP_FILENAME = FT.MAP_FILENAME
+TIER_EXPECT = FT.TIER_EXPECT
+content_mismatch = FT.content_mismatch
 
-# ★ 每一档「正确的内容」长什么样（用于发现"名字与内容不符"）
-#   真机踩过的坑：Mode 名字写着 hs 低速 25%，里面挂的却是 hs-standard(60%)
-#   ⇒ 屏幕切「低速」实际跑 60%，看起来像切档没生效，其实是数据错了。
-TIER_EXPECT = {
-    5: {"hs-smart", "hs-cpu-graph", "hs-case-graph"},
-    2: {"hs-low"},
-    3: {"hs-standard"},
-    4: {"hs-high"},
-}
-
-UID_RE = re.compile(r"[0-9a-f]{64}")
-
-
-def mode_profiles(mode):
-    """收集一个 Mode 所有 channel 引用的 profile_uid / speed_fixed 描述"""
-    profs, fixed = set(), []
-    for dev in (mode.get("all_device_settings") or {}).values():
-        if not isinstance(dev, dict):
-            continue
-        for st in dev.values():
-            if not isinstance(st, dict):
-                continue
-            if st.get("profile_uid"):
-                profs.add(str(st["profile_uid"]))
-            elif "speed_fixed" in st:
-                fixed.append(f"{st['speed_fixed']}%")
-    return profs, sorted(set(fixed))
-
-
-def content_mismatch(mode, tier):
-    """判断 Mode 内容是否与档位相符。返回 (描述, 是否不符)"""
-    profs, fixed = mode_profiles(mode)
-    shown = []
-    if profs:
-        shown.extend(sorted(profs))
-    if fixed:
-        shown.append("Fixed " + "/".join(fixed))
-    desc = ", ".join(shown) or "（空）"
-    bad = [p for p in profs if p not in TIER_EXPECT.get(tier, set())]
-    if not profs and not fixed:
-        return desc, True
-    if fixed and tier in (2, 3, 4):
-        return desc, False          # 直接写死转速也算有效内容
-    return desc, bool(bad)
 
 
 def modes_path():
@@ -169,107 +128,41 @@ def save_map(mapping, path=None):
 
 
 def _index_by_uid(modes):
-    return {m.get("uid"): m for m in modes.get("modes", [])
-            if isinstance(m, dict)}
+    return FT.index_by_uid(modes)
 
 
 def _norm(s):
-    return re.sub(r"\s+", "", str(s or "")).lower()
-
-
-def _match_by_name(modes, mode, exact=None):
-    """按 Mode 名字认领档位。exact 非空时先做精确匹配。"""
-    lst = modes.get("modes", [])
-    if exact:
-        e = _norm(exact)
-        for m in lst:
-            if _norm(m.get("name")) == e:
-                return m.get("uid")
-        for m in lst:                      # 退一步：包含
-            if e and e in _norm(m.get("name")):
-                return m.get("uid")
-    # 前缀（"hs 智能…"）
-    pref = _norm(NAME_PREFIX.get(mode, ""))
-    if pref:
-        for m in lst:
-            if _norm(m.get("name")).startswith(pref):
-                return m.get("uid")
-    # 关键词
-    for key in NAME_KEYS.get(mode, ()):
-        for m in lst:
-            n = _norm(m.get("name"))
-            if _norm(key) and _norm(key) in n:
-                return m.get("uid")
-    return None
+    return FT.norm_name(s)
 
 
 def resolve(mode, modes=None, mapping=None):
-    """档位 → Mode uid。找不到返回 None。"""
+    """档位 → Mode uid。★ 规则全部委托 fan-tier（唯一权威）。找不到返回 None。"""
     try:
         mode = int(mode)
     except (TypeError, ValueError):
         return None
     modes = modes if modes is not None else load_modes()
-    mapping = mapping if mapping is not None else load_map()
-    by_uid = _index_by_uid(modes)
-
-    # ① 显式绑定（值可能是 uid，也可能是名字）
-    want = mapping.get(str(mode), "").strip()
-    if want:
-        if want in by_uid:
-            return want
-        hit = _match_by_name(modes, mode, exact=want)
-        if hit:
-            return hit
-        print(f"[fan-map] ⚠ 档位 {mode} 绑定的 {want!r} 在当前 modes.json 里找不到，"
-              "回退自动匹配", file=sys.stderr)
-
-    # ② 默认 uid
-    d = DEFAULT_UIDS.get(mode)
-    if d and d in by_uid:
-        return d
-
-    # ③④ 名字认领
-    return _match_by_name(modes, mode)
+    if mapping is None:
+        mapping = {int(k): v for k, v in load_map().items()}
+    else:
+        mapping = {int(k): v for k, v in mapping.items()}
+    u = FT.resolve(mode, modes, binding=mapping)
+    if u is None and mapping.get(mode):
+        print(f"[fan-map] ⚠ 档位 {mode} 绑定的 {mapping[mode]!r} 在当前 modes.json "
+              "里找不到，回退自动匹配", file=sys.stderr)
+    return u
 
 
 def reverse(uid, modes=None, mapping=None):
-    """Mode uid → 档位。识别不出返回 None。"""
+    """Mode uid → 档位。★ 规则全部委托 fan-tier。识别不出返回 None。"""
     if not uid:
         return None
     modes = modes if modes is not None else load_modes()
-    mapping = mapping if mapping is not None else load_map()
-    by_uid = _index_by_uid(modes)
-
-    # ① 显式绑定里直接指向这个 uid 的
-    for k, v in mapping.items():
-        try:
-            k = int(k)
-        except (TypeError, ValueError):
-            continue
-        if v == uid:
-            return k
-        if v and v not in by_uid and _match_by_name(modes, k, exact=v) == uid:
-            return k
-
-    # ② 默认 uid
-    for m_, u in DEFAULT_UIDS.items():
-        if u == uid:
-            return m_
-
-    # ③ 名字
-    m = by_uid.get(uid)
-    name = _norm((m or {}).get("name"))
-    if not name:
-        return None
-    for m_ in FAN_MODE_ORDER:
-        if _norm(NAME_PREFIX.get(m_, "")) and name.startswith(_norm(NAME_PREFIX[m_])):
-            return m_
-    for m_ in FAN_MODE_ORDER:
-        for key in NAME_KEYS.get(m_, ()):
-            if _norm(key) and _norm(key) in name:
-                return m_
-    return None
+    if mapping is None:
+        mapping = {int(k): v for k, v in load_map().items()}
+    else:
+        mapping = {int(k): v for k, v in mapping.items()}
+    return FT.reverse(uid, modes, binding=mapping)
 
 
 def bad_uids(modes):
@@ -277,7 +170,7 @@ def bad_uids(modes):
     bad = []
     for m in modes.get("modes", []):
         for u in (m.get("all_device_settings") or {}):
-            if not UID_RE.fullmatch(str(u)):
+            if not FT.UID_RE.fullmatch(str(u)):
                 bad.append((m.get("uid"), str(u)))
     return bad
 
@@ -365,7 +258,7 @@ def cmd_bind(pairs):
             print(f"已解除档位 {k} 的绑定")
             continue
         # 允许用名字绑定：能解析成 uid 就存 uid（更稳）
-        hit = v if v in by_uid else _match_by_name(modes, int(k), exact=v)
+        hit = v if v in by_uid else FT._match_by_name(modes, v)
         mp[k] = hit or v
         print(f"档位 {k}（{FAN_MODES.get(int(k), '?')}）→ {mp[k]}"
               + ("" if hit else "  ⚠ 当前 modes.json 里没有它，保存但暂时不可用"))

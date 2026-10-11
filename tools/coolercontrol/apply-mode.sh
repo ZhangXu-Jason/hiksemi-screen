@@ -65,30 +65,22 @@ warn() { printf '[fan-apply] WARN: %s\n' "$*" >&2; }
 die()  { printf '[fan-apply] ERROR: %s\n' "$*" >&2; exit 1; }
 
 # ── 档位 → Mode uid ─────────────────────────────────────────────────────────
-# ★ 解析交给 fan-mode-map.py（支持 --bind 显式绑定 / 默认 uid / 名字匹配）。
-#   该脚本不存在时退回内嵌的写死 uid（功能不降级，只是不支持自定义绑定）。
+# ★ 解析**只**交给 fan-mode-map.py（其规则又来自唯一权威 fan-tier.py）。
+#   本脚本刻意【不再内嵌】默认 uid 表或名字前缀表——历史上那份副本规则更弱
+#   （只认 "hs X" 前缀），一旦 fan-mode-map.py 缺失就会给出与其它组件不同的
+#   结果，导致「屏幕显示 A、CC 实际 B」。缺脚本就明确报错，不猜。
 MAP_PY="${CC_FAN_MODE_MAP_PY:-$(cd "$(dirname "$0")" && pwd)/fan-mode-map.py}"
 
-hardcoded_uid_for() {
+resolve_uid_for() {
     case "$1" in
-        5) echo "hs-smart"    ;;
-        2) echo "hs-low"      ;;
-        3) echo "hs-standard" ;;
-        4) echo "hs-high"     ;;
+        5|2|3|4) : ;;                       # 先校验档位合法
         *) return 1 ;;
     esac
-}
-
-resolve_uid_for() {
-    hardcoded_uid_for "$1" || return 1      # 先校验档位合法
-    if [ -f "$MAP_PY" ]; then
-        local u
-        if u="$(python3 "$MAP_PY" --resolve "$1" 2>/dev/null)" && [ -n "$u" ]; then
-            echo "$u"
-            return 0
-        fi
-    fi
-    hardcoded_uid_for "$1"
+    [ -f "$MAP_PY" ] || die "档位解析需要 $MAP_PY，但没找到（请重跑安装器同步 tools/coolercontrol/）"
+    local u
+    u="$(python3 "$MAP_PY" --resolve "$1" 2>/dev/null)" || return 1
+    [ -n "$u" ] || return 1
+    echo "$u"
 }
 mode_name_for() {
     case "$1" in
@@ -288,10 +280,9 @@ if ! have_root; then
 fi
 
 # 原子更新 modes.json：current_active_mode / previous_active_mode
-# ★ python 负责：把新 JSON 写进 $TMP，并把【最终采用的 mode uid】打印到 stdout。
-#   为什么要把 uid 回传：真机上 Mode 可能是用户在 Web UI 里手工建的，
-#   uid 是随机 UUID（1a700658-…）而不是我们的 hs-smart；此时按【名字前缀】
-#   回退匹配，否则界面切档会直接失败「目标 Mode 不在 modes.json 中」。
+# ★ resolve_uid_for 已经用 fan-mode-map.py（→ fan-tier.py）解析出真正要激活的
+#   uid；若它在 modes.json 里不存在，说明映射与实际不同步（需 --scan/--bind），
+#   这里【只报错】、不再内嵌一套更弱的名字匹配（避免与权威规则不一致）。
 TMP="$(mktemp)"
 NEW_UID="$(python3 - "$MODE_CONFIG" "$TMP" "$MODE_UID" "$MODE_ARG" <<'PY'
 import json, re, sys
@@ -301,24 +292,15 @@ with open(path, encoding="utf-8") as f:
 modes = d.get("modes", [])
 uids = [m.get("uid") for m in modes]
 if target not in uids:
-    # 兜底：MAP_PY 不在时的【名字前缀】回退（hs-smart → "hs 智能…"）
-    prefix = {"hs-smart": "hs 智能", "hs-low": "hs 低速",
-              "hs-standard": "hs 标准", "hs-high": "hs 强劲"}.get(target)
-    alt = next((m.get("uid") for m in modes
-                if prefix and (m.get("name") or "").startswith(prefix)), None)
-    if not alt:
-        print(f"目标 Mode {target!r} 不在 modes.json 中（可选: {uids}）",
-              file=sys.stderr)
-        print("★ 若 Mode 是你在 Web UI 里新建的（uid 为随机 UUID），执行：",
-              file=sys.stderr)
-        print(f"    sudo ./apply-mode.sh --scan            # 看有哪些 Mode",
-              file=sys.stderr)
-        print(f"    sudo ./apply-mode.sh --bind {fan_mode}=<uid 或 Mode 名字>",
-              file=sys.stderr)
-        sys.exit(1)
-    print(f"[fan-apply] 注意: 未找到 uid={target}，按名字匹配到 {alt}",
+    print(f"目标 Mode {target!r} 不在 modes.json 中（可选: {uids}）",
           file=sys.stderr)
-    target = alt
+    print("★ 若 Mode 是你在 Web UI 里新建的（uid 为随机 UUID），执行：",
+          file=sys.stderr)
+    print("    sudo ./apply-mode.sh --scan            # 看有哪些 Mode / 每档解析到谁",
+          file=sys.stderr)
+    print(f"    sudo ./apply-mode.sh --bind {fan_mode}=<uid 或 Mode 名字>",
+          file=sys.stderr)
+    sys.exit(1)
 # ★ 目标 Mode 里若混有未渲染的占位符键（@DEVICE_UID@），切过去也不会生效
 bad = [k for m in modes if m.get("uid") == target
        for k in (m.get("all_device_settings") or {})
@@ -339,45 +321,36 @@ PY
 [ -n "$NEW_UID" ] || { rm -f "$TMP"; die "更新 modes.json 失败（未拿到 mode uid）"; }
 [ "$NEW_UID" = "$MODE_UID" ] || MODE_UID="$NEW_UID"
 
-# 原样写回（保留缩进 2）
-if [ "$DRY_RUN" = "1" ]; then
-    log "[dry-run] 将把 current_active_mode 设为 ${MODE_UID}（${MODE_NAME}）"
-    rm -f "$TMP"
-else
-    # ★★ 顺序：先停 daemon → 再写文件 → 再启动。
-    #   为什么先停：daemon 退出时可能把内存里的旧 current_active_mode 刷回
-    #   modes.json，把我们的改动覆盖掉（症状 =「切了没反应 / 自己又切回去」）。
+read_back() {
+    python3 -c "import json;print(json.load(open('$MODE_CONFIG',encoding='utf-8')).get('current_active_mode',''))" 2>/dev/null
+}
+
+# 单次「写 + 重启」：★ 唯一一处落地动作，重试用同一个函数（不再复制粘贴）
+apply_once() {
     if cc_detect_ctl; then
+        # 先停：某些 daemon 退出时会把内存里的旧 current_active_mode 刷回文件
         cc_ctl_run stop >/dev/null 2>&1 && sleep 1
     fi
     cat "$TMP" > "$MODE_CONFIG"
     log "已设置 current_active_mode = ${MODE_UID}（档位 ${MODE_ARG}=${MODE_NAME}）"
-fi
-
-restart_daemon
-RC=$?
+    restart_daemon
+}
 
 if [ "$DRY_RUN" = "1" ]; then
+    log "[dry-run] 将把 current_active_mode 设为 ${MODE_UID}（${MODE_NAME}）"
     log "[dry-run] 完成（未改动任何文件）"
     rm -f "$TMP"
     exit 0
 fi
 
-# ── 回读确认 + 一次自愈重试 ────────────────────────────────────────────────
-#   daemon 不同版本在被 stop/start 时对 modes.json 的写法不一致，
-#   这里再兜一次：发现被覆盖就重写 + 重启（只重试一次，避免死循环）。
-read_back() {
-    python3 -c "import json;print(json.load(open('$MODE_CONFIG',encoding='utf-8')).get('current_active_mode',''))" 2>/dev/null
-}
+apply_once; RC=$?
 sleep 1
 NOW="$(read_back)"
+
+# 回读不一致 → 再落地一次（daemon 版本差异可能把文件写回；只重试一次防死循环）
 if [ "$NOW" != "$MODE_UID" ] && [ "$RC" = "0" ]; then
     warn "回读值 ${NOW:-（空）} ≠ ${MODE_UID}（疑似被 daemon 重写）→ 重写并再重启一次"
-    cc_ctl_run stop >/dev/null 2>&1 || true
-    sleep 1
-    cat "$TMP" > "$MODE_CONFIG"
-    restart_daemon
-    RC=$?
+    apply_once; RC=$?
     sleep 1
     NOW="$(read_back)"
 fi

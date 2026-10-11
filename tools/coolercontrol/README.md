@@ -65,22 +65,31 @@ CoolerControl daemon 启动 → activate_mode("hs-high")
 | `modes.json` | **模板**。4 个 Mode 快照（均双通道），含占位符 |
 | `render-config.py` | 占位符渲染 + TOML/JSON 契约自校验 + 原子写 + 备份；支持双风扇/单风扇/降级 |
 | `apply-mode.sh` | **中间件调用的落地脚本**。`apply-mode.sh {5\|2\|3\|4}` |
-| `fan-mode-map.py` | ★ 档位 ↔ Mode 映射解析：`--scan` / `--bind` / `--resolve` / `--reverse` |
+| `fan-tier.py` | ★★ **档位规则的唯一权威来源**（其他脚本都 import 它，规则只此一份）。可当 CLI：`--uids` / `--keys` / `--tier N` / `--self-test` |
+| `fan-mode-map.py` | 档位 ↔ Mode 映射解析的**薄封装**（规则委托 `fan-tier.py`）：`--scan` / `--bind` / `--resolve` / `--reverse` |
 | `hs-fan-mode-map.json` | 渲染时一并生成的绑定文件（4 档 → `hs-*` uid）；`--bind` 改写它 |
 | `probe-coolercontrol.sh` | 只读探测真机：安装形态、端口、真实 device_uid / **真实通道名 fanN** / CPU 与机箱温度源 |
 | `README.md` | 本文档 |
+
+> ★★ **改档位规则只改 `fan-tier.py` 一处**。`render-config.py` / `fan-mode-map.py` /
+> `middleware.py` / `apply-mode.sh` 全部委托它；历史上因规则被复制 4~5 份且结构不一致，
+> 出现过「屏幕显示 A、CC 实际跑 B」。
 
 ## ★ 档位 ↔ Mode 绑定（自建 Mode 也不会失去同步）
 
 在 Web UI 里**自己新建**的 Mode，uid 是随机 UUID（`1a700658-…`），不是 `hs-smart`。
 若档位写死 uid，屏幕切档就找不到目标 Mode ⇒「屏幕和 CoolerControl 不同步」。
 
-解析优先级（`fan-mode-map.py`）：
+解析优先级（`fan-tier.py` 的 `resolve()`，正/反向同规则）：
 
 1. **显式绑定** `hs-fan-mode-map.json`（值可以是 uid，也可以是 Mode 名字）
 2. 默认 uid：`hs-smart` / `hs-low` / `hs-standard` / `hs-high`
 3. 名字前缀：`"hs 智能…"` / `"hs 低速…"` / `"hs 标准…"` / `"hs 强劲…"`
 4. 名字含关键词：`智能|smart` / `低速|low|静音` / `标准|standard` / `强劲|high|性能`
+
+★ 全表**先跑前缀轮、再跑关键词轮**（两轮内都按档位顺序 5→2→3→4），结果确定可预期；
+★ `claimed` 排除：某档已被显式绑定/默认 uid 占用时，别的 Mode 名字再像也不能认领该档
+（防两档抢同一个 Mode）。
 
 ```bash
 sudo ./apply-mode.sh --scan                     # 有哪些 Mode？每档绑定到谁？
@@ -90,7 +99,13 @@ sudo ./apply-mode.sh --current                  # 当前激活的 Mode 对应哪
 ```
 
 **反向同步**：中间件读 `modes.json` 的 `current_active_mode` 反查档位，
-在 UI 里手动切了模式，小屏回显会自动跟上（不会反向写回，避免死循环）。
+在 UI 里手动切了模式，小屏回显会自动跟上（**绝不**反向写回，避免死循环）。
+
+★ **防自我回滚（无标记、无时间窗）**：`FanState.update()` 是**先**更新本地档位、
+**再**落地到 CC；`mode()` 反向同步只做 `if ext is not None and ext != 本地档位`。
+自己写下去的回波必然 `ext == 本地` ⇒ 天然不会被回滚；只有两者确实不同
+（＝用户在 CC UI 真手动切了）才同步。因此**不需要**任何"自写标记 / 时间窗"。
+抓现行：`sudo ./probe-coolercontrol.sh watch 30`（正常 `3→2`；自我回滚 `3→2→3`）。
 
 ## ★ 「选了低速，跑出来却是 60%」= Mode 名字与内容不符
 
