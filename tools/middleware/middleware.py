@@ -59,7 +59,7 @@ DEFAULT_KEY = os.path.join(BASE, "key.pem")
 
 # ★ 版本号：每次有行为变更就递增。日志启动段会打印，
 #   用于判断「真机上跑的是哪一版」——排查"改了没生效"时第一眼就看它。
-MIDDLEWARE_VERSION = "2026.10.11-b（散热风扇：CoolerControl 双向同步 + 无标记防自我回滚）"
+MIDDLEWARE_VERSION = "2026.10.11-c（散热风扇：档位绑定逻辑加固 + 规则唯一权威 fan-tier.py）"
 
 
 def _code_fingerprint():

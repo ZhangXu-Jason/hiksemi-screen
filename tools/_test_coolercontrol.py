@@ -657,6 +657,63 @@ fan4 = { disabled = true }
     ok("回读被改回时自愈重试一次", "重写并再重启一次" in a2)
     ok("sync ④ 提示 HIKSEMI_FAN_CC_RESTART", "HIKSEMI_FAN_CC_RESTART" in ptxt)
 
+    # ── [15] 绑定逻辑加固：key 归一 / 两种写法统一 / 档位校验 / bind_ok ──
+    sec("[15] 绑定逻辑加固（key 归一 + uid/名字统一 + 档位校验 + 失效告警）")
+    b_dir = os.path.join(TMPROOT, "bindhard")
+    os.makedirs(b_dir, exist_ok=True)
+    b_modes = os.path.join(b_dir, "modes.json")
+    b_map = os.path.join(b_dir, "hs-fan-mode-map.json")
+    with open(b_modes, "w", encoding="utf-8") as f:
+        json.dump(modes_ui, f, ensure_ascii=False)
+
+    def run_bind(args):
+        env = dict(os.environ, CC_MODE_CONFIG=b_modes, CC_FAN_MODE_MAP=b_map)
+        p = subprocess.run([sys.executable, MAP, *args],
+                           capture_output=True, text=True, env=env)
+        return p.returncode, (p.stdout + p.stderr).strip()
+
+    # ① --bind 只接受 5/2/3/4（1 档非法）
+    rc, out = run_bind(["--bind", "1=whatever"])
+    ok("--bind 拒绝非法档位 1（★ 无 1 档）",
+       rc != 0 and "无 1 档" in out, out)
+    rc, out = run_bind(["--bind", "9=x"])
+    ok("--bind 拒绝档位 9", rc != 0, out)
+
+    # ② 按名字绑定 → 存成 uid（更稳）；随后 key 类型不影响解析
+    rc, out = run_bind(["--bind", "2=hs 低速 25%"])
+    ok("--bind 按名字 → 解析成 uid 存盘",
+       rc == 0 and json.load(open(b_map, encoding="utf-8")).get("2") == U_LOW, out)
+
+    # ③ 绑定指向不存在的 Mode → 非 0 + 明确告警（不静默）
+    rc, out = run_bind(["--bind", "4=完全不存在xyz"])
+    ok("--bind 指向不存在的 Mode → 非 0 且告警",
+       rc != 0 and "找不到" in out, out)
+
+    # ④ --scan 显式标出「绑定失效」并给解除指引
+    rc, out = run_bind(["--scan"])
+    ok("--scan 标出绑定失效", "绑定失效" in out, out[-400:])
+    ok("--scan 给出解除绑定指引", "--bind 4=" in out, out[-400:])
+    ok("--scan 标出「显式绑定」来源", "显式绑定" in out, out[-400:])
+
+    # ⑤ --explain 输出 JSON 且与 --scan 同源（reason 带依据）
+    rc, out = run_bind(["--explain"])
+    try:
+        ex = json.loads(out)
+        reasons = {e["tier"]: e["reason"] for e in ex}
+        ok("--explain 输出四档 JSON", set(reasons) == {5, 2, 3, 4}, out[:200])
+        ok("--explain 档位 2 reason=bind", reasons.get(2) == "bind", str(reasons))
+        ok("--explain 档位 4 绑定失效(bind_ok=False)",
+           any(e["tier"] == 4 and e["bind_ok"] is False for e in ex), out[:400])
+    except Exception as e:
+        ok("--explain 可解析为 JSON", False, f"{e}: {out[:200]}")
+
+    # ⑥ 解除绑定后回落到名字匹配（reason 不再是 bind）
+    run_bind(["--bind", "4="])
+    rc, out = run_bind(["--explain"])
+    ex = {e["tier"]: e for e in json.loads(out)}
+    ok("解除绑定后 reason=name（回落到名字匹配）",
+       ex[4]["reason"] == "name" and ex[4]["bind_value"] == "", out[:300])
+
 finally:
     shutil.rmtree(TMPROOT, ignore_errors=True)
 

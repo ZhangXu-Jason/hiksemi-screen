@@ -32,7 +32,12 @@ fan-mode-map.py —— 【档位 ↔ CoolerControl Mode】映射解析器
     ./fan-mode-map.py --bind 5=<uid|名字> 2=…   # 显式绑定（写进映射文件）
     ./fan-mode-map.py --resolve 5               # 输出该档位应激活的 Mode uid
     ./fan-mode-map.py --reverse                 # 输出当前激活 Mode 对应的档位号
+    ./fan-mode-map.py --explain                 # ★ 四档完整解析说明（JSON，含依据）
     ./fan-mode-map.py --path                    # 打印映射文件实际路径
+
+★ 绑定值可以是 uid，也可以是 Mode 名字；两种写法由 fan-tier._binding_lookup
+  统一收口，正反向共用（不存在"正向认 A、反向认 B"的漂移）。
+★ --bind 只接受 5/2/3/4（无 1 档）；绑定指向不存在的 Mode 时会明确告警。
 
 路径可用环境变量覆盖：
     CC_MODE_CONFIG    modes.json 路径（默认 /etc/coolercontrol/modes.json）
@@ -142,15 +147,18 @@ def resolve(mode, modes=None, mapping=None):
     except (TypeError, ValueError):
         return None
     modes = modes if modes is not None else load_modes()
-    if mapping is None:
-        mapping = {int(k): v for k, v in load_map().items()}
-    else:
-        mapping = {int(k): v for k, v in mapping.items()}
-    u = FT.resolve(mode, modes, binding=mapping)
-    if u is None and mapping.get(mode):
-        print(f"[fan-map] ⚠ 档位 {mode} 绑定的 {mapping[mode]!r} 在当前 modes.json "
-              "里找不到，回退自动匹配", file=sys.stderr)
-    return u
+    # mapping 的键形态由 fan-tier.normalize_binding 统一收口（str/int 均可）
+    return FT.resolve(mode, modes, binding=mapping)
+
+
+def resolve_reason(mode, modes=None, mapping=None):
+    """档位 → (uid, reason)。reason ∈ bind/default/name/none，供诊断。"""
+    try:
+        mode = int(mode)
+    except (TypeError, ValueError):
+        return None, "none"
+    modes = modes if modes is not None else load_modes()
+    return FT.resolve_tier(mode, modes, binding=mapping)
 
 
 def reverse(uid, modes=None, mapping=None):
@@ -158,10 +166,6 @@ def reverse(uid, modes=None, mapping=None):
     if not uid:
         return None
     modes = modes if modes is not None else load_modes()
-    if mapping is None:
-        mapping = {int(k): v for k, v in load_map().items()}
-    else:
-        mapping = {int(k): v for k, v in mapping.items()}
     return FT.reverse(uid, modes, binding=mapping)
 
 
@@ -176,6 +180,10 @@ def bad_uids(modes):
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
+_REASON_LABEL = {"bind": "显式绑定", "default": "默认 uid",
+                 "name": "名字匹配", "none": "未匹配"}
+
+
 def cmd_scan():
     modes = load_modes()
     mp = load_map()
@@ -197,13 +205,22 @@ def cmd_scan():
             for c, v in ch.items())
         print(f"  {str(m.get('uid'))[:36]:<38} {m.get('name','')[:28]:<30} "
               f"{chans[:40]}{mark}")
+
+    # ★ 解析说明：直接调 fan-tier.explain()（与实际落地同一条代码路径）
+    trace = {e["tier"]: e for e in FT.explain(modes, binding=mp)}
+    by_uid2 = _index_by_uid(modes)
     print("\n档位绑定解析：")
     rc = 0
-    by_uid2 = _index_by_uid(modes)
     mismatched = []
+    broken_binds = []
     for m_ in FAN_MODE_ORDER:
-        u = resolve(m_, modes, mp)
-        src = "显式绑定" if mp.get(str(m_)) else ("默认 uid" if u == DEFAULT_UIDS.get(m_) else "名字匹配")
+        e = trace[m_]
+        u = e["uid"]
+        src = _REASON_LABEL.get(e["reason"], e["reason"])
+        if e["bind_value"] and not e["bind_ok"]:
+            # 绑定了但解析不到 → 明确告警（此前只是静默回退）
+            broken_binds.append((m_, e["bind_value"]))
+            src += " \033[33m（绑定失效）\033[0m"
         if u:
             mm = by_uid2.get(u) or {}
             nm = mm.get("name", "?")
@@ -220,6 +237,16 @@ def cmd_scan():
             print(f"  {m_} {FAN_MODES[m_]:<4} → \033[31m未匹配\033[0m"
                   f"  ← 用 --bind 绑定，或把 Mode 名字改成含「{FAN_MODES[m_]}」")
             rc = 1
+    if broken_binds:
+        rc = 1
+        print("\n\033[33m⚠ 有绑定指向了当前不存在的 Mode（已回退到自动匹配）\033[0m：")
+        for m_, bv in broken_binds:
+            print(f"    档位 {m_}（{FAN_MODES[m_]}）绑的 {bv!r} 在 modes.json 里找不到"
+                  "（Mode 被删/改名了？）")
+        print("    修：重新绑定，或解除绑定回到自动认领——")
+        for m_, _ in broken_binds:
+            print(f"      sudo ./apply-mode.sh --bind {m_}=<新 uid 或 Mode 名字>")
+            print(f"      sudo ./apply-mode.sh --bind {m_}=          # 解除")
     if mismatched:
         print("\n\033[31m✗ 档位名字与内容不符\033[0m —— 屏幕切到这一档会跑成别的转速"
               "（例如「低速」实际 60%）：")
@@ -241,30 +268,49 @@ def cmd_scan():
 def cmd_bind(pairs):
     mp = load_map()
     modes = load_modes()
-    by_uid = _index_by_uid(modes)
+    rc = 0
     for pair in pairs:
         if "=" not in pair:
             print(f"忽略非法参数 {pair!r}（应为 档位=uid 或 档位=名字）", file=sys.stderr)
+            rc = 2
             continue
         k, v = pair.split("=", 1)
         k, v = k.strip(), v.strip()
+        # ★ 档位必须是四档之一（此前 int() 能过就收 ⇒ --bind 1=x 会存进去）
         try:
-            k = str(int(k))
+            kt = int(k)
         except ValueError:
             print(f"忽略非法档位 {k!r}（只接受 5/2/3/4）", file=sys.stderr)
+            rc = 2
             continue
+        if kt not in FAN_MODE_ORDER:
+            print(f"忽略非法档位 {k!r}（只接受 "
+                  f"{'/'.join(str(t) for t in FAN_MODE_ORDER)}；★ 无 1 档）",
+                  file=sys.stderr)
+            rc = 2
+            continue
+        k = str(kt)
         if not v:
             mp.pop(k, None)
             print(f"已解除档位 {k} 的绑定")
             continue
-        # 允许用名字绑定：能解析成 uid 就存 uid（更稳）
-        hit = v if v in by_uid else FT._match_by_name(modes, v)
-        mp[k] = hit or v
-        print(f"档位 {k}（{FAN_MODES.get(int(k), '?')}）→ {mp[k]}"
-              + ("" if hit else "  ⚠ 当前 modes.json 里没有它，保存但暂时不可用"))
+        # ★ 绑定值统一走 fan-tier 的 _binding_lookup（uid / 名字同一套规则）：
+        #   能立刻解析成 uid 就存 uid（最稳）；解析不到就把用户原样输入存起来
+        #   （Mode 可能稍后才建），并明确告警 —— 不静默存一个"看着像成功"的值。
+        uid, how = FT._binding_lookup(v, modes)
+        if uid:
+            mp[k] = uid
+            note = "" if how == "uid" else "（按名字解析）"
+            print(f"档位 {k}（{FAN_MODES.get(kt, '?')}）→ {uid} {note}")
+        else:
+            mp[k] = v
+            print(f"档位 {k}（{FAN_MODES.get(kt, '?')}）→ {v}"
+                  "  \033[33m⚠ 当前 modes.json 里找不到它，已原样保存；"
+                  "Mode 建好后需复查 --scan\033[0m")
+            rc = 1
     p = save_map(mp)
     print(f"已写入 {p}")
-    return 0
+    return rc
 
 
 def main(argv):
@@ -283,11 +329,20 @@ def main(argv):
         if len(argv) < 2:
             print("用法：--resolve <5|2|3|4>", file=sys.stderr)
             return 2
-        u = resolve(argv[1])
+        mp = load_map()
+        u, reason = resolve_reason(argv[1], mapping=mp)
         if not u:
-            print(f"档位 {argv[1]} 匹配不到任何 Mode", file=sys.stderr)
+            bv = mp.get(str(argv[1])) or mp.get(argv[1]) or ""
+            print(f"档位 {argv[1]} 匹配不到任何 Mode"
+                  + (f"（绑定值 {bv!r} 解析不到 Mode，且名字也认领不了）" if bv else
+                     "（名字里没有档位关键词，也没做 --bind）"), file=sys.stderr)
             return 1
         print(u)
+        return 0
+    if a == "--explain":
+        modes = load_modes()
+        print(json.dumps(FT.explain(modes, binding=load_map()),
+                         ensure_ascii=False, indent=2))
         return 0
     if a == "--reverse":
         modes = load_modes()

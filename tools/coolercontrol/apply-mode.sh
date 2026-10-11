@@ -77,8 +77,15 @@ resolve_uid_for() {
         *) return 1 ;;
     esac
     [ -f "$MAP_PY" ] || die "档位解析需要 $MAP_PY，但没找到（请重跑安装器同步 tools/coolercontrol/）"
-    local u
-    u="$(python3 "$MAP_PY" --resolve "$1" 2>/dev/null)" || return 1
+    local u err
+    # ★ 保留 stderr：解析失败时应把它打印出来（含"绑定失效/无匹配"的明确原因），
+    #   不再静默吞掉 —— 否则用户只看到"切档失败"却不知为何。
+    u="$(python3 "$MAP_PY" --resolve "$1" 2>/tmp/.fan-apply-resolve.err)" || {
+        err="$(cat /tmp/.fan-apply-resolve.err 2>/dev/null)"; rm -f /tmp/.fan-apply-resolve.err
+        [ -n "$err" ] && log "档位 $1 解析说明：$err"
+        return 1
+    }
+    rm -f /tmp/.fan-apply-resolve.err
     [ -n "$u" ] || return 1
     echo "$u"
 }

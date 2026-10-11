@@ -105,7 +105,8 @@ CoolerControl daemon 启动
 | `modes.json` | **模板**：4 个 Mode 快照（均**双通道**）+ `order` + `current_active_mode` | 是 |
 | `render-config.py` | 渲染占位符 + 契约自校验（TOML/JSON）+ 原子写 + 自动备份；支持双风扇/单风扇/降级；`--merge-modes` 与现有 `modes.json` 合并（保留 UI 自建 Mode）、`--rename-modes` 让名字与实际转速一致（见 §6.7） | — |
 | `apply-mode.sh` | **中间件实际调用的入口**：`apply-mode.sh {5\|2\|3\|4}`；另有 `--scan` / `--bind` / `--current` / `--status`（见 §6.5）。重启通道**模糊匹配** systemd/docker，支持 `HIKSEMI_FAN_CC_RESTART`；找不到重启通道**非 0 退出** | — |
-| `fan-mode-map.py` | ★ 档位 ↔ Mode 映射解析器：`--scan` / `--bind` / `--resolve` / `--reverse`（**自建 Mode 也不会失去同步**） | — |
+| `fan-tier.py` | ★★ 档位规则的**唯一权威来源**（其余脚本都 import 它，规则只此一份）；CLI：`--uids` / `--keys` / `--tier N` / `--explain` / `--self-test` | — |
+| `fan-mode-map.py` | 档位 ↔ Mode 映射解析的**薄封装**（规则委托 `fan-tier.py`）：`--scan` / `--bind` / `--resolve` / `--reverse` / `--explain`（**自建 Mode 也不会失去同步**） | — |
 | `hs-fan-mode-map.json` | 渲染时生成的绑定文件（4 档 → `hs-*` uid），`--bind` 会改写它 | — |
 | `probe-coolercontrol.sh` | 只读探测真机：安装形态 / 端口 / 真实 uid / **真实通道名 fanN** / CPU 与机箱温度源；`modes` 子命令 = 诊断「Mode 在 UI 里空白」（见 §6.4） | — |
 
@@ -365,8 +366,8 @@ sudo /screen/tools/coolercontrol/probe-coolercontrol.sh modes   # 复查应全�
 uid 是随机 UUID**（`1a700658-89d7-4d03-…`），不是 `hs-smart` ⇒ 屏幕发过来的
 档位找不到目标 Mode，链路断开。
 
-**现在的做法：绑定外置 + 自动认领**（`tools/coolercontrol/fan-mode-map.py`），
-解析优先级从高到低：
+**现在的做法：绑定外置 + 自动认领**（规则唯一权威在 `tools/coolercontrol/fan-tier.py`，
+`fan-mode-map.py` 只是它的命令行包装），解析优先级从高到低：
 
 | 优先级 | 规则 | 例子 |
 | --- | --- | --- |
@@ -378,9 +379,15 @@ uid 是随机 UUID**（`1a700658-89d7-4d03-…`），不是 `hs-smart` ⇒ 屏�
 ⇒ **在 UI 里随便建模式也行，名字里带档位关键词（智能/低速/标准/强劲）就能自动认领**；
 名字完全无关（比如"我的自定义模式"）时，绑定一次即可，不必重渲染、不必改 uid。
 
+★ **正反向共用同一套规则**（`fan-tier.resolve_tier()`）：绑定值的两种写法
+（uid / 名字）由 `_binding_lookup()` 统一收口，映射文件的键类型（`"2"` 或 `2`）
+由 `normalize_binding()` 统一成整数 —— 不会出现"正向认 A、反向认 B"或
+"写进去却读不出来"的静默失效。
+
 ```bash
-# ① 看清楚有哪些 Mode、每档当前绑定到谁（只读）
+# ① 看清楚有哪些 Mode、每档当前绑定到谁 + 解析依据（只读）
 sudo /screen/tools/coolercontrol/apply-mode.sh --scan
+sudo /screen/tools/coolercontrol/fan-mode-map.py --explain   # JSON：每档 uid/reason/bind_ok
 
 # ② 绑定：用 uid 或 Mode 名字都行（可一次绑多个档位）
 sudo /screen/tools/coolercontrol/apply-mode.sh --bind 5=1a700658-89d7-4d03-8443-c9260d1604d9
@@ -392,6 +399,12 @@ sudo /screen/tools/coolercontrol/apply-mode.sh --bind 2=
 
 绑定结果写在 `hs-fan-mode-map.json`（默认与 `modes.json` 同目录，
 `render-config.py` 渲染时会一并生成，内容就是四个 `hs-*` uid）。
+
+★ **绑定加固**（避免"以为绑上了其实没生效"）：
+- `--bind` **只接受 5/2/3/4**（★ 无 1 档）；非法档位直接报错不写入。
+- 按**名字**绑定时会立刻解析成 uid 存盘（最稳）；解析不到才原样存，并**非 0 退出**告警。
+- 绑定指向已被删除/改名的 Mode 时：`--scan` 会标出 **`[显式绑定（绑定失效）]`** 并
+  给出解除/重绑命令；`--explain` 的 `bind_ok=false` 同样能看出（**不再静默回退**）。
 
 **反向同步（CoolerControl → 小屏）**：中间件在生成状态帧时会读
 `modes.json` 的 `current_active_mode` 反查档位，在 UI 里手动切了模式，
