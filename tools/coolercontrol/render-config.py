@@ -463,8 +463,11 @@ def validate_modes(obj, expect_uids=("hs-smart", "hs-low", "hs-standard", "hs-hi
 #   于是「屏幕切低速 → 实际跑 60%」，看起来像 bug，其实是数据错了。
 #   --merge-modes <现有文件> 让渲染产物【继承】现有 Mode 的 uid / name / order，
 #   只把内容（通道 / profile / 转速）换成渲染结果 ⇒ 内容正确 + UI 模式不丢。
-TIER_PROFILE = {5: "hs-smart", 2: "hs-low", 3: "hs-standard", 4: "hs-high"}
-TIER_LABEL = {5: "智能", 2: "低速", 3: "标准", 4: "强劲"}
+#   ★ 档位相关的权威常量一律取自 fan-tier.py（唯一权威），本文件不另存副本：
+#     TIER_PROFILE ≡ FT.DEFAULT_UIDS（每档的默认 uid）
+#     TIER_LABEL   ≡ FT.FAN_MODES  （每档的中文名）
+TIER_PROFILE = FT.DEFAULT_UIDS
+TIER_LABEL = FT.FAN_MODES
 HEX64 = re.compile(r"[0-9a-f]{64}")
 
 

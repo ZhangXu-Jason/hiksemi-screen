@@ -532,22 +532,24 @@ $TOOLS/                      # ★ 默认 /screen/tools（持久目录）
 ├── probe.sh                 # ★ 唯一硬件探测脚本（env 能力快照 / i2c-led 交互 / enable-i2c / fan）
 ├── test.sh                  # ★ 唯一测试入口（middleware/_test_*.py + _test_coolercontrol.py + _test_installer.sh）
 ├── decode-hslog.py          # ★ 程序日志 AES 解密器（日志是加密的！）
-├── _test_installer.sh       # 安装器回归测试实现（100 断言，由 test.sh 调用）
-├── _test_coolercontrol.py   # CoolerControl 渲染器测试（37 断言：双风扇/降级/校验，由 test.sh 调用）
+├── _test_installer.sh       # 安装器回归测试实现（136 断言，由 test.sh 调用）
+├── _test_coolercontrol.py   # CoolerControl 渲染器测试（180 断言：v4 切档/双风扇/降级/规则唯一，由 test.sh 调用）
 ├── coolercontrol/           # ★ 风扇 4 档 → CoolerControl 落地（安装器按需自动部署）
 │   ├── config.toml          # 模板：profiles / functions / device-settings（含 @占位符@，双风扇 pwm1/pwm2）
 │   ├── modes.json           # 模板：4 个 Mode 快照（hs-smart/low/standard/high，均双通道）
 │   ├── render-config.py     # 渲染模板 + 契约自校验（真机 uid 渲染后才可写入；支持单/双风扇与降级）
-│   ├── apply-mode.sh        # ★ 中间件调用的落地脚本（{5|2|3|4} → 切 Mode + 重启 daemon）
-│   ├── probe-coolercontrol.sh  # 只读探测：安装形态 / 真实 device_uid / 双路 pwm 通道 / 温度源
+│   ├── fan-tier.py          # ★ 档位规则唯一权威（uid / 名字前缀 / 关键词 / 内容校验，其余脚本 import 它）
+│   ├── fan-mode-map.py      # 档位 ↔ Mode 映射解析（薄封装，CLI：--scan / --bind / --resolve / --reverse）
+│   ├── apply-mode.sh        # ★ 中间件调用的落地脚本（v4：stop → 写 config.toml + modes.json → start）
+│   ├── probe-coolercontrol.sh  # 只读探测：安装形态 / daemon 停启通道 / 真实 device_uid / 双路 fanN / 温度源
 │   └── README.md            # 使用说明
 ├── cert.pem / key.pem       # 自签证书（中间件用；首次自检时生成）
 └── middleware/              # ★ 服务中间件（目录内容）
     ├── middleware.py        # 服务主体（纯 Python 标准库）
-    ├── middleware.py.orig   # 原始副本（安装器留存，便于回滚）
     ├── data-mapping.json    # ★ 数据映射配置（改这里）
     ├── _test_eth_builder.py # 网卡/盘位 builder 单元测试（桩模拟，离线跑）
     ├── _test_fan.py         # 散热风扇 4 档单元测试（含 CoolerControl 适配器分支）
+    ├── _test_hwmon.py       # hwmon 温度源单元测试
     ├── _test_led_*.py       # LED 相关单元测试（i2c / state / e2e）
     ├── _test_off_time.py    # 自动息屏单元测试
     ├── _test_set_power.py   # 关机重启单元测试
@@ -559,7 +561,7 @@ $TOOLS/                      # ★ 默认 /screen/tools（持久目录）
 
 > **回归测试**：改动 `middleware.py` / `data-mapping.json` / `install-autostart.sh` /
 > `coolercontrol/*` 后，在工具目录跑 `bash test.sh`
-> （= 中间件 347 + CoolerControl 渲染器 37 + 安装器 119 = **503 断言**，
+> （= 中间件 **398** + CoolerControl 渲染器 **180** + 安装器 **136** = **714 断言**，
 > 改完必跑；Windows 开发机可直接跑，无需真机）。
 > 子命令：`middleware` / `coolercontrol` / `installer` 可只跑其中一类。
 

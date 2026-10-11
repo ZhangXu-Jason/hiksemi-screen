@@ -10,7 +10,7 @@
 #     sudo ./probe-coolercontrol.sh modes      # ★ 诊断「Mode 在 UI 里内容为空」
 #         （比对 daemon 真值设备表 / modes.json 引用的 UID / 通道 / profile）
 #     sudo ./probe-coolercontrol.sh sync       # ★★ 诊断「屏幕 ↔ CoolerControl 不同步」
-#         （工具版本 / 档位绑定 / 反向档位 / 重启通道 / 中间件是否已重启 / 自我回滚防护）
+#         （工具版本 / 档位绑定 / 反向档位 / daemon 停启通道 / 中间件是否已重启 / 自我回滚防护 / config.toml 一致性）
 #     sudo ./probe-coolercontrol.sh watch      # ★★ 实时盯 modes.json 变化（抓"切了又弹回"）
 #     CC_DIR=/path ./probe-coolercontrol.sh modes   # 配置目录不在 /etc/coolercontrol 时
 # =============================================================================
@@ -71,13 +71,14 @@ fi
 
 # ── 0.0 sync 分支：★ 「屏幕 ↔ CoolerControl 不同步」一次性取证 ─────────────
 #   症状：屏幕切档 CC 没反应 / 在 CC UI 里切模式屏幕不跟 / 新建模式后失联。
-#   链条有六环，任一环断都会表现成"不同步"，逐环查：
+#   链条有七环，任一环断都会表现成"不同步"，逐环查：
 #     ① 工具是不是新版（旧脚本 = 修了也没用）
-#     ② 档位能不能解析出 Mode（绑定）
-#     ③ 改完配置有没有人去重启 daemon（重启通道存在吗）
-#     ④ 改完配置有没有人去重启 daemon（重启通道存在吗）
+#     ② 档位能不能解析出 Mode（绑定）+ 名字与内容是否相符
+#     ③ 反向：当前 Mode 能不能反查出屏幕档位
+#     ④ daemon 停/启通道（v4 切档 = stop → 写 config.toml → start）
 #     ⑤ 中间件有没有重启（反向同步是新代码，跑着旧进程就不会生效）
 #     ⑥ 自我回滚防护（★ 屏幕切档后自己弹回去的根因）
+#     ⑦ config.toml 与当前 Mode 是否一致（★「模式改了配置没改」的直接判据）
 if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     CC_DIR="${CC_DIR:-/etc/coolercontrol}"
     HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -129,32 +130,44 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     fi
 
     SEC "④ daemon 停/启通道（★ v4 切档 = stop → 写 config.toml → start，必须能停能启）"
+    # ★ 与 apply-mode.sh 的 cc_detect_ctl 保持【同一套判定】：
+    #   ① HIKSEMI_FAN_CC_RESTART（自定义整条命令）优先；
+    #   ② 再 systemd（list-unit-files 模糊匹配）；
+    #   ③ 再 docker（名字 → 镜像名兜底）。
+    #   ★ 注意：自定义命令【拆不开】stop/start ⇒ 只能走 --restart 整条兜底
+    #     （apply-mode.sh 会因此走 restart 路径，probe 这里要如实说明）。
     FOUND=0
+    if [ -n "${HIKSEMI_FAN_CC_RESTART:-}" ]; then
+        OK "HIKSEMI_FAN_CC_RESTART 已设（自定义命令）"
+        INFO "命令: ${HIKSEMI_FAN_CC_RESTART}"
+        INFO "  ★ 自定义命令无法拆 stop/start ⇒ 切档将走【整条 restart】兜底"
+        FOUND=1
+    fi
     if command -v systemctl >/dev/null 2>&1; then
         U="$(systemctl list-unit-files --type=service --plain --no-legend 2>/dev/null \
-             | awk '{print $1}' | grep -i 'coolercontrol' || true)"
-        for s in $U; do
-            OK "systemd 服务: $s ($(systemctl is-active "${s%.service}" 2>/dev/null))"
-            INFO "重启命令: sudo systemctl restart ${s%.service}"
+             | awk '{print $1}' | grep -i -m1 'coolercontrol' || true)"
+        if [ -n "$U" ]; then
+            OK "systemd 服务: $U ($(systemctl is-active "${U%.service}" 2>/dev/null))"
+            INFO "  ★ apply-mode.sh 实际会：stop/start ${U%.service}（v4 顺序）"
             FOUND=1
-        done
+        fi
     fi
     if command -v docker >/dev/null 2>&1; then
-        DOCK="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i coolercontrol || true)"
-        if [ -z "$DOCK" ]; then
-            DOCK="$(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
-                    | grep -i coolercontrol | cut -f1 || true)"
+        C="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i -m1 'coolercontrol' || true)"
+        if [ -z "$C" ]; then
+            C="$(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
+                 | grep -i 'coolercontrol' | head -1 | cut -f1 || true)"
         fi
-        for c in $DOCK; do
-            OK "docker 容器: $c（按名字或镜像名模糊匹配）"
-            INFO "重启命令: sudo docker restart $c"
+        if [ -n "$C" ]; then
+            OK "docker 容器: $C（按名字或镜像名模糊匹配）"
+            INFO "  ★ apply-mode.sh 实际会：docker stop/start $C（v4 顺序）"
             FOUND=1
-        done
+        fi
     fi
     if [ "$FOUND" = "0" ]; then
-        NG "既没找到 systemd 服务也没找到 docker 容器
-      ⇒ ★ v4 切档要 stop→写→start，找不到通道就只能【整条 restart 兜底】。
-      ⇒ 需要兜底时修法（任选其一）：
+        NG "既没找到 systemd 服务 / docker 容器，也没设 HIKSEMI_FAN_CC_RESTART
+      ⇒ ★ v4 切档要 stop→写→start，找不到通道 ⇒ 只能【整条 restart 兜底】。
+      ⇒ 修法（任选其一）：
          export HIKSEMI_FAN_CC_RESTART='docker restart <容器名>'
          （写进 hiksemi-sub.service 的 Environment=，
            或直接在中间件用 HIKSEMI_FAN_APPLY_CMD 指定整条命令）"

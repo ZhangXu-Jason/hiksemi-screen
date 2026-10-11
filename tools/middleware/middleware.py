@@ -1771,6 +1771,8 @@ class FanState:
         # ★ 外部应用落地（无论是否变化都重放一次，保证与系统一致）。
         #   落地后 CC 的 current_active_mode 会变成 new_mode，与本地一致 ⇒
         #   反向同步读到相同值、不会覆盖（自我回滚自然被挡住，无需额外标记）。
+        #   ★★ 刻意【不引入】"自写窗口/时间窗"补丁（教训 96）：只要保证
+        #      "先更新本地、再落地"，`ext == cur` 就是充要条件，与读几次无关。
         apply_to_external_app(state)
         return state, prev != new_mode
 

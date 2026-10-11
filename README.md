@@ -89,7 +89,7 @@ sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1
 ## 排障与自检
 
 ```bash
-sudo bash tools/test.sh            # 全量回归（516 断言）
+sudo bash tools/test.sh            # 全量回归（714 断言）
 bash tools/test.sh middleware      # 只跑中间件
 bash tools/diag.sh                 # 一键体检（链路 / I2C / 屏 / 电源 / 网络 / 日志）
 bash tools/probe.sh                # 只读探测（环境 / I2C / 风扇）
@@ -110,12 +110,16 @@ tools/
 ├── middleware/
 │   ├── middleware.py         # ★ 本地 REST 服务（纯标准库）
 │   ├── data-mapping.json     # ★ 字段级映射配置（热重载）
-│   └── _test_*.py            # 中间件单元测试（347 断言）
+│   └── _test_*.py            # 中间件单元测试（398 断言）
 └── coolercontrol/
     ├── config.toml           # 模板（含 @占位符@，渲染后落到 /etc/coolercontrol/）
     ├── modes.json            # 四档模式定义
     ├── render-config.py      # 模板渲染器（含契约校验）
-    ├── apply-mode.sh         # 切档落地
+    ├── apply-mode.sh         # 切档落地（v4：stop → 写 config.toml+modes.json → start）
+    ├── fan-tier.py           # ★ 档位规则唯一权威（其它脚本都 import 它）
+    ├── fan-mode-map.py       # 档位 ↔ Mode 映射解析（薄封装）
+    ├── hs-fan-mode-map.json  # 渲染时生成的绑定文件
+    ├── README.md             # CoolerControl 接入详解
     └── probe-coolercontrol.sh
 docs/                         # 8 份专题文档（见下）
 ```

@@ -64,13 +64,16 @@
 #     ③ stop→写→start 稳定、幂等、可离线回放。切档是低频操作，
 #        stop/start 各约 1-2s（风扇短暂回到开机默认后立刻应用新档）可接受。
 #
-# ★★ 重启通道是模糊匹配的（systemd 服务名 / docker 容器名都可能被改）：
-#     HIKSEMI_FAN_CC_RESTART='docker restart my-cc'      # 自定义整条命令
-#     找不到重启通道时会【非 0 退出】并打印排查指引 —— 因为「写文件成功但没人
-#     重启」等于档位没生效，而症状恰好就是「屏幕切档、CoolerControl 没反应」。
+# ★★ 停/启通道是模糊匹配的（systemd 服务名 / docker 容器名都可能被改）：
+#     HIKSEMI_FAN_CC_RESTART='docker restart my-cc'      # 自定义【整条】命令
+#     ★ 自定义命令拆不开 stop/start ⇒ 自动退化为「整条 restart 兜底」。
+#     系统里既没有 systemd 服务 / docker 容器、也没设上面的变量时：
+#       → 先写 modes.json，config.toml 无法安全落地（会被覆盖）
+#       → 非 0 退出并打印排查指引（因为"写文件成功但没人重启" = 档位没生效，
+#         症状恰好就是「屏幕切档、CoolerControl 没反应」）。
 #
-# 退出码：0=成功 / 2=参数或文件问题 / 5=config.toml 与 Mode 内容不符
-#   （旧的 3/4 "无重启通道/被改回" 已不再使用 —— 切档不再依赖重启）
+# 退出码：0=成功 / 2=参数或文件问题 / 5=config.toml 与 Mode 内容不符 或 停启失败
+#   （旧的 3/4 "无重启通道/被改回" 已不再使用）
 # =============================================================================
 set -uo pipefail
 
@@ -188,9 +191,17 @@ cc_ctl_run() {     # $1 = restart | stop | start
     local act="$1"
     case "$CC_CTL_KIND" in
         custom)
-            # 自定义命令只能整条执行；stop/start 无法拆分 ⇒ 只在 restart 时用
-            [ "$act" = "restart" ] || return 0
-            sh -c "$CC_CTL_NAME" ;;
+            # ★ 自定义命令是"一条整命令"，无法拆成 stop/start。
+            #   restart → 执行整条；stop/start → 【返回失败】(2)，让调用方
+            #   得知"拆不开"，从而回退到整条 restart 兜底。
+            #   ★ 曾错写成 `[ "$act" = restart ] || return 0` —— 对 stop/start
+            #     返回 0 会让 apply_once 误以为"已成功停止"（STOPPED=1），
+            #     实际 daemon 仍在跑 ⇒ 写 config.toml 被覆盖 ⇒ 回到"配置没改"的坑。
+            if [ "$act" = "restart" ]; then
+                sh -c "$CC_CTL_NAME"
+            else
+                return 2
+            fi ;;
         systemd) systemctl "$act" "$CC_CTL_NAME" ;;
         docker)  docker "$act" "$CC_CTL_NAME" ;;
         *)       return 1 ;;
@@ -423,12 +434,26 @@ PY
 #   返回 0=已确认，1=无法判定或改动失败。
 ensure_apply_on_boot() {
     [ -f "$CONFIG_TOML" ] || return 1
-    # 快路径：段内（或任意处）已有 true —— 用 Python 精确定位，避免误判注释行
+    # ★ 快路径：必须同时满足 —— ① [settings] 段内有 apply_on_boot = true，
+    #   且 ② 段外【没有】任何 apply_on_boot 键（否则要进慢路径清理段外键）。
     python3 - "$CONFIG_TOML" <<'PY' && return 0
 import re, sys
 t = open(sys.argv[1], encoding="utf-8").read()
-sys.exit(0 if re.search(r'^[ \t]*apply_on_boot[ \t]*=[ \t]*true[ \t]*(#.*)?$',
-                        t, flags=re.M) else 1)
+lines = t.splitlines()
+in_settings = False
+ok_inside = False
+outside = False
+for ln in lines:
+    s = ln.strip()
+    if s.startswith("["):
+        in_settings = bool(re.match(r'^\[settings\][ \t]*$', s))
+        continue
+    if re.match(r'^[ \t]*apply_on_boot[ \t]*=', ln):
+        if in_settings and re.match(r'^[ \t]*apply_on_boot[ \t]*=[ \t]*true[ \t]*(#.*)?$', ln):
+            ok_inside = True
+        elif not in_settings:
+            outside = True
+sys.exit(0 if (ok_inside and not outside) else 1)
 PY
     python3 - "$CONFIG_TOML" <<'PY' || return 1
 import re, sys
@@ -457,25 +482,38 @@ def find_sec(name):
             break
     return (start, end)
 
-# ① 任意位置的字面键（非注释）→ 就地置 true
+sec = find_sec("settings")
+srange = range(*sec) if sec else range(0)   # [settings] 段的行号范围
+# ★ 只改【[settings] 段内】的既有键；段外（文件头/别的段）的同名键一律删除，
+#   否则 daemon 仍会因顶层键而行不通（且与段内键冲突）。
+removed_outside = 0
+kept = []
 for i, ln in enumerate(lines):
     if re.match(r'^[ \t]*apply_on_boot[ \t]*=', ln):
-        lines[i] = re.sub(r'^([ \t]*apply_on_boot[ \t]*=).*?(\r?\n?)$',
-                          r'\1 true\2', ln)
-        open(p, "w", encoding="utf-8").write("".join(lines))
-        sys.exit(0)
+        if i in srange:
+            kept.append(re.sub(r'^([ \t]*apply_on_boot[ \t]*=).*?(\r?\n?)$',
+                               r'\1 true\2', ln))
+        else:
+            removed_outside += 1        # 段外键 → 丢弃
+        continue
+    kept.append(ln)
+lines = kept
 
-sec = find_sec("settings")
-if sec:
-    start, _ = sec
-    # ② 插到 [settings] 头之后（段内首行），保持可读
-    lines.insert(start, "apply_on_boot = true\n")
-else:
-    # ③ 没有 [settings] 段 → 末尾补一个（保证前面的最后一行以换行结尾）
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
-    lines.append("\n[settings]\napply_on_boot = true\n")
+# 段内已保留（或刚改）了键；否则插入/新建
+has_key = any(re.match(r'^[ \t]*apply_on_boot[ \t]*=', ln) for ln in lines)
+if not has_key:
+    sec = find_sec("settings")
+    if sec:
+        start, _ = sec
+        lines.insert(start, "apply_on_boot = true\n")
+    else:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append("\n[settings]\napply_on_boot = true\n")
 open(p, "w", encoding="utf-8").write("".join(lines))
+if removed_outside:
+    print(f"[ensure] 删除了 {removed_outside} 个【段外】apply_on_boot 键"
+          f"（顶层键 daemon 读不到）", file=sys.stderr)
 PY
 }
 
@@ -557,41 +595,54 @@ PY
 #   ★★ 为什么必须 stop 在前：config.toml 是 daemon 的「所有物」，
 #      运行时写会被它退出/保存时覆盖掉（官方文档明写）。所以：
 #        stop（daemon 把内存态落盘并退出）→ 我们覆盖写 → start（按新内容应用）。
-#   ★ 只 stop/start 不了（无重启通道）时也【照写】—— 至少 modes.json 是好的；
-#      但 config.toml 的改动可能被覆盖，由后面的回读判据报出来。
+#   ★ 若【停不了】(无停/启通道，或自定义命令拆不开)：
+#       - 不写 config.toml（写了也会被运行中的 daemon 覆盖，等于白写且误导）；
+#       - 有 --restart 兜底时：整条 restart —— daemon 启动时按 active mode 重应用；
+#       - 连 restart 都没有：明确告警 + RC=1，由回读判据报出（不再"假装成功"）。
 apply_once() {
     STOPPED=0
-    if cc_detect_ctl; then
-        if cc_ctl_run stop >/dev/null 2>&1; then
-            STOPPED=1
-            sleep 2                      # 等 daemon 真正退出并完成落盘
-        else
-            warn "stop 失败（继续写；config.toml 改动可能被 daemon 覆盖）"
-        fi
+    CAN_STOP=0
+    local err=0
+    if cc_detect_ctl && cc_ctl_run stop >/dev/null 2>&1; then
+        CAN_STOP=1
+        STOPPED=1
+        sleep 2                      # 等 daemon 真正退出并完成落盘
     fi
-    # ★ 写 modes.json（"模式"层：UI 一致性 + 反向同步）
+    # ★ 写 modes.json（"模式"层：UI 一致性 + 反向同步）——任何情况都写
     cat "$TMP" > "$MODE_CONFIG"
     log "已设置 current_active_mode = ${MODE_UID}（档位 ${MODE_ARG}=${MODE_NAME}）"
-    # ★★ 写 config.toml 的 [device-settings]（"生效"层：daemon 启动就是读它）
+    # ★★ 写 config.toml 的 [device-settings]（"生效"层）
+    #    ★ 前提：daemon 已停（否则写进去会被覆盖）。停不了时【不写】，
+    #      交给下面的 restart 兜底 —— 而不是白写一次又骗自己"写过了"。
     if [ -f "$CONFIG_TOML" ]; then
-        if write_device_settings; then
-            log "已把档位内容写入 config.toml 的 [device-settings]"
+        if [ "$CAN_STOP" = "1" ]; then
+            if write_device_settings; then
+                log "已把档位内容写入 config.toml 的 [device-settings]"
+            else
+                warn "写 config.toml 的 [device-settings] 失败（模式可能未真正落地）"
+                err=1
+            fi
         else
-            warn "写 config.toml 的 [device-settings] 失败（模式可能未真正落地）"
+            warn "无法 stop daemon ⇒ 跳过直接写 config.toml（会被覆盖），改走 restart 兜底"
         fi
     fi
-    # ★ start（让 daemon 按新的 [device-settings] 应用）
+    # ★ start / restart
     if [ "$STOPPED" = "1" ]; then
         if cc_ctl_run start >/dev/null 2>&1; then
             log "已启动 CoolerControl（按新配置应用）"
         else
-            warn "start 失败：$(cc_ctl_desc)"
-            RC=1
+            warn "★ start 失败：$(cc_ctl_desc) —— daemon 未运行，风扇将不受控！"
+            err=1
         fi
     elif [ "$RESTART" = "1" ]; then
-        restart_daemon || RC=1
+        restart_daemon || err=1
+    else
+        # 既停不了也没开兜底 ⇒ 明确告警（不静默）
+        warn "既无法 stop 也无 restart 兜底 ⇒ config.toml 可能未被应用"
+        warn "  修：设 HIKSEMI_FAN_CC_RESTART='<整条重启命令>' 或加 --restart"
+        err=1
     fi
-    return 0
+    return "$err"
 }
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -613,6 +664,8 @@ if [ -f "$CONFIG_TOML" ]; then
     fi
 fi
 
+# ★ RC 取 apply_once 的真实返回（stop/写/start 任一环节失败 ⇒ 非 0）。
+#   旧写法 `apply_once; RC=$?` 因函数恒 return 0 而把内部失败吞掉 ⇒ 已修。
 apply_once; RC=$?
 sleep 2
 NOW="$(read_back)"
@@ -624,7 +677,7 @@ if [ -f "$CONFIG_TOML" ]; then
     config_matches_mode; CFG_OK=$?
     if [ "$CFG_OK" = "1" ]; then
         warn "config.toml 与当前 Mode【不一致】→ 再落地一次"
-        apply_once; RC=$?
+        apply_once; RC2=$?; [ "$RC2" != "0" ] && RC="$RC2"
         sleep 2
         NOW="$(read_back)"
         config_matches_mode; CFG_OK=$?
@@ -642,6 +695,13 @@ fi
 if [ ! -f "$CONFIG_TOML" ]; then
     warn "未找到 $CONFIG_TOML（CoolerControl 未安装？）—— 已只写 modes.json"
     exit 0
+fi
+# ★ 先判"落地动作本身有没有失败"（stop/写/start），再看配置是否一致。
+#   否则 start 失败导致 daemon 挂着、而 config.toml 恰好一致时会误报成功。
+if [ "$RC" != "0" ]; then
+    warn "★ 落地过程有失败（stop/写/start 之一）——即使 config.toml 看似一致也不可信。"
+    warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync"
+    exit 5
 fi
 if [ "$CFG_OK" = "0" ]; then
     log "档位切换完成：${MODE_ARG}(${MODE_NAME}) → ${MODE_UID}（config.toml 已同步）"

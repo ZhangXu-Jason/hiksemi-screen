@@ -654,8 +654,17 @@ sudo ./probe-coolercontrol.sh sync
 `sync` 的 **⑦ 环**「config.toml 与当前 Mode 是否一致」会逐通道打印
 `config.toml=…  ≠  Mode=…`，并提示同步新版脚本 / 重渲配置 / 用 `--restart` 兜底。
 
-**退出码总表**：`0`=成功 / `2`=参数或文件问题 / `5`=`config.toml` 与 Mode 内容不符。
+**退出码总表**：`0`=成功 / `2`=参数或文件问题 / `5`=`config.toml` 与 Mode 内容不符
+**或** 落地动作（stop/写/start）之一失败。
 （旧的 `3`/`4` 已废弃 —— 切档不再依赖重启。）
+
+#### 6.9.1 v4.1 修复的三个 bug（2026-10-11 代码审查）
+
+| # | 问题 | 症状 | 修法 |
+|---|---|---|---|
+| 1 | `cc_ctl_run` 对 `custom` 通道的 `stop/start` **直接 `return 0`**（假装成功） | `apply_once` 误判 `STOPPED=1` ⇒ 在**运行中的 daemon** 上写 `config.toml` ⇒ 被覆盖 ⇒ 回到"配置没改" | `custom` 的 `stop/start` 改为 `return 2` ⇒ 自动回退整条 `restart` 兜底 |
+| 2 | `apply_once` 恒 `return 0`，内部 `RC=1` 被 `RC=$?` 立刻冲掉 | `start` 失败（daemon 挂着、风扇失控）却仍可能 `exit 0` 报成功 | 改为 `return "$err"`；主流程 `RC!=0 ⇒ exit 5`，不再误报成功 |
+| 3 | `ensure_apply_on_boot` 快路径只判"文件里有没有 `true`" | 键跑到**文件头/别的段**（顶层键）也被当成 OK ⇒ "看着修了其实没修" | 快路径改为校验键**在 `[settings]` 段内**且**段外无同名键**；慢路径清理段外键 |
 
 ## 7. 为什么用「改文件 + stop/start daemon」而不是调 REST API
 

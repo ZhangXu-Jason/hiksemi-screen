@@ -523,15 +523,18 @@ fan4 = { disabled = true }
            p.returncode == 0 and "智能" in (p.stdout + p.stderr),
            (p.stdout + p.stderr)[-300:])
 
-    # 「屏幕 ↔ CC 不同步」六环诊断（sync 子命令）
+    # 「屏幕 ↔ CC 不同步」七环诊断（sync 子命令）
     ok("probe 支持 sync 子命令", '"sync"' in ptxt or "'sync'" in ptxt)
     ok("sync ① 先查工具是不是新版", "工具版本" in ptxt)
     ok("sync ② 查档位绑定", "档位 → Mode 绑定" in ptxt)
     ok("sync ③ 查反向档位", "反向档位" in ptxt)
-    ok("sync ④ 查重启通道（改完要有人重启 daemon）", "重启通道" in ptxt)
+    ok("sync ④ 查 daemon 停/启通道（v4：stop→写→start）",
+       "daemon 停/启通道" in ptxt)
     ok("sync ⑤ 查中间件是否已重启（新代码跑了没）", "中间件是否已重启" in ptxt)
     ok("sync ⑥ 查自我回滚防护（屏幕切档弹回的根因）",
        "自我回滚防护" in ptxt and "_cc_current_fan_mode" in ptxt)
+    ok("sync ⑦ 查 config.toml 与当前 Mode 是否一致",
+       "config.toml 与 modes.json 是否一致" in ptxt)
     ok("sync 提示重跑安装器即可同步（不再是 cp -rn 永不覆盖）",
        "内容比对同步" in ptxt or "cp -f" in ptxt)
 
@@ -789,6 +792,21 @@ fan4 = { disabled = true }
         rc, a2 = run_ab(a1)
         ok("⑥ ensure_apply_on_boot 幂等", a1 == a2, a2)
 
+        # ⑦ ★ bug 回归：键在【文件头/别的段】(段外) 且为 true ⇒ 必须被纠正到
+        #    [settings] 段内（顶层键 daemon 读不到 = "看着修了其实没修"）
+        rc, after = run_ab('apply_on_boot = true\n\n[devices]\nfoo = 1\n'
+                           '\n[settings]\ntimeout = 5\n')
+        head, _, tail = after.partition("[settings]")
+        ok("★ ⑦ 段外的 apply_on_boot 被移进 [settings]（顶层键不被接受）",
+           "apply_on_boot = true" in tail and "apply_on_boot" not in head,
+           after)
+        # ⑧ ★ 段外键 + 段内已有 true ⇒ 段外那个必须被删（不留冲突的顶层键）
+        rc, after = run_ab('apply_on_boot = true\n\n[settings]\n'
+                           'apply_on_boot = true\n')
+        head = after.split("[settings]", 1)[0]
+        ok("★ ⑧ 段外重复键被删除，只保留 [settings] 段内的",
+           "apply_on_boot" not in head, after)
+
     # config_matches_mode 行为验证（引号写法必须认）
     cm_m = re.search(r"config_matches_mode\(\) \{.*?\n\}\n", a3, flags=re.S)
     ok("config_matches_mode 可提取", bool(cm_m))
@@ -852,6 +870,39 @@ fan4 = { disabled = true }
        "HIKSEMI_FAN_CC_RESTART_ON_APPLY" in a4)
     ok("不再使用旧的 exit 3/4（切档不依赖重启）",
        "exit 3" not in a4 and "exit 4" not in a4)
+
+    # ── ★ bug 回归：custom 通道 stop/start 不得"假装成功" ──
+    #   旧写法 `[ "$act" = restart ] || return 0` ⇒ stop 返回 0 ⇒ apply_once
+    #   误判已停（STOPPED=1）⇒ 在运行中的 daemon 上写 config.toml ⇒ 被覆盖。
+    ok("★ cc_ctl_run：custom 的 stop/start 不再 return 0（返回非 0 以便回退）",
+       'return 2' in a4 and 'if [ "$act" = "restart" ]; then' in a4)
+    ok("★ apply_once：停不了时【不写】config.toml（避免被覆盖）",
+       "CAN_STOP" in a4 and "跳过直接写 config.toml" in a4)
+    ok("★ apply_once 用 return \"$err\" 传播失败（不再恒 return 0）",
+       'return "$err"' in a4)
+    ok("★ 主流程尊重 apply_once 返回码（RC!=0 ⇒ exit 5，不误报成功）",
+       'apply_once; RC=$?' in a4 and '[ "$RC" != "0" ]' in a4)
+
+    # ── ★ 行为验证：custom stop/start 返回非 0，restart 执行整条 ──
+    cr_m = re.search(r"cc_ctl_run\(\) \{.*?\n\}\n", a4, flags=re.S)
+    ok("cc_ctl_run 可提取", bool(cr_m))
+    if cr_m:
+        ch = os.path.join(TMPROOT, "fn_ctl.sh")
+        with open(ch, "w", encoding="utf-8", newline="\n") as f:
+            f.write("#!/usr/bin/env bash\nset -uo pipefail\n" +
+                    cr_m.group(0) +
+                    '\nCC_CTL_KIND="custom"; CC_CTL_NAME="echo RESTARTED"\n'
+                    'cc_ctl_run stop >/dev/null 2>&1; echo "stop_rc=$?"\n'
+                    'cc_ctl_run start >/dev/null 2>&1; echo "start_rc=$?"\n'
+                    'echo "restart_out=$(cc_ctl_run restart)"\n')
+        r = subprocess.run(["bash", ch], capture_output=True, text=True)
+        out = r.stdout
+        ok("★ custom 的 stop 返回非 0（不是“假装成功”的 0）",
+           "stop_rc=0" not in out, out)
+        ok("★ custom 的 start 返回非 0",
+           "start_rc=0" not in out, out)
+        ok("★ custom 的 restart 执行整条自定义命令",
+           "restart_out=RESTARTED" in out, out)
 
     w_m = re.search(r"write_device_settings\(\) \{.*?\n\}\n", a4, flags=re.S)
     ok("write_device_settings 可提取", bool(w_m))

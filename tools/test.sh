@@ -3,7 +3,7 @@
 # hiksemi-sub · 统一测试入口 ★ 全项目唯一的测试脚本
 # ------------------------------------------------------------
 # 把散落的测试收成一处调用：
-#   · middleware/_test_*.py  —— 中间件单元/集成测试（7 个文件）
+#   · middleware/_test_*.py  —— 中间件单元/集成测试（8 个文件）
 #   · _test_coolercontrol.py —— CoolerControl 配置渲染器测试（双风扇/降级/校验）
 #   · _test_installer.sh     —— 安装器回归测试
 #
