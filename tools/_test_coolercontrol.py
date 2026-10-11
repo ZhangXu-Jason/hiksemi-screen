@@ -652,9 +652,7 @@ fan4 = { disabled = true }
        "grep -i -m1 'coolercontrol'" in a2)
     ok("支持 HIKSEMI_FAN_CC_RESTART 自定义重启命令",
        "HIKSEMI_FAN_CC_RESTART" in a2)
-    ok("找不到重启通道时非 0 退出（不再假装成功）", "exit 3" in a2)
-    ok("先停 daemon 再写文件（防退出时把旧值刷回）", "cc_ctl_run stop" in a2)
-    ok("回读被改回时自愈重试一次", "重写并再重启一次" in a2)
+    ok("仍保留重启兜底能力（restart_daemon）", "restart_daemon()" in a2)
     ok("sync ④ 提示 HIKSEMI_FAN_CC_RESTART", "HIKSEMI_FAN_CC_RESTART" in ptxt)
 
     # ── [15] 绑定逻辑加固：key 归一 / 两种写法统一 / 档位校验 / bind_ok ──
@@ -723,7 +721,8 @@ fan4 = { disabled = true }
     a3 = open(APPLY, encoding="utf-8", errors="replace").read()
     ok("apply-mode.sh 新增 ensure_apply_on_boot", "ensure_apply_on_boot()" in a3)
     ok("apply-mode.sh 新增 config_matches_mode", "config_matches_mode()" in a3)
-    ok("落地前确保 apply_on_boot=true", "确保 apply_on_boot=true" in a3)
+    ok("落地前确保 apply_on_boot=true（配置段位正确）",
+       "ensure_apply_on_boot" in a3.replace("ensure_apply_on_boot()", ""))
     ok("config.toml 不符时非零退出（exit 5 判据）", "exit 5" in a3)
     ok("★ 键写进 [settings] 段而非文件头（TOML 语义）",
        "find_sec" in a3 and 'lines.insert(start' in a3)
@@ -733,8 +732,11 @@ fan4 = { disabled = true }
        "⑦ config.toml 与 modes.json 是否一致" in ptxt)
     ok("probe ⑦ 有 NG 时给出结论（模式改了配置没跟上）",
        "模式改了但 config.toml 没跟上" in ptxt)
-    ok("probe ⑦ 提示 apply_on_boot",
-       "apply_on_boot 必须 = true" in ptxt)
+    ok("probe ⑦ 提示同步新版 apply-mode.sh（直接写 config.toml）",
+       "apply-mode.sh 落地时会【自己写 config.toml】" in ptxt
+       or "自己写 config.toml" in ptxt)
+    ok("probe ④ 标注默认不重启",
+       "--restart 兜底" in ptxt or "默认切档【不重启】" in ptxt)
 
     # 提取 ensure_apply_on_boot 独立可执行体，做行为验证
     fn_m = re.search(r"ensure_apply_on_boot\(\) \{.*?\n\}\n", a3, flags=re.S)
@@ -827,6 +829,90 @@ fan4 = { disabled = true }
         ok("⑩ 空 Mode 视为不一致（激活无意义）",
            run_cm('[device-settings."dev1"]\n"fan3" = { speed_fixed = 25 }\n',
                   "ZZZ") == "rc=1")
+
+    # ── [17] 切档 = 直接写 config.toml，默认不重启 daemon ────────────────────
+    #  核心：① write_device_settings 把 Mode 内容写进 [device-settings]
+    #        ② 与 config_matches_mode 端到端一致（写完即 matches rc=0）
+    #        ③ 默认不重启；--restart / --no-restart / 环境变量可控
+    sec("[17] 切档直接写 config.toml（不重启 daemon）")
+
+    a4 = open(APPLY, encoding="utf-8", errors="replace").read()
+    ok("apply-mode.sh 新增 write_device_settings", "write_device_settings()" in a4)
+    ok("★ 默认不重启：apply_once 里 restart 受 RESTART 开关控制",
+       '[ "$RESTART" = "1" ] &&' in a4 or 'if [ "$RESTART" = "1" ]; then' in a4)
+    ok("支持 --restart / --no-restart 参数",
+       "--restart)" in a4 and "--no-restart)" in a4)
+    ok("支持 HIKSEMI_FAN_CC_RESTART_ON_APPLY 环境变量",
+       "HIKSEMI_FAN_CC_RESTART_ON_APPLY" in a4)
+    ok("不再使用旧的 exit 3/4（切档不依赖重启）",
+       "exit 3" not in a4 and "exit 4" not in a4)
+
+    w_m = re.search(r"write_device_settings\(\) \{.*?\n\}\n", a4, flags=re.S)
+    ok("write_device_settings 可提取", bool(w_m))
+    if w_m:
+        wh = os.path.join(TMPROOT, "fn_w.sh")
+        with open(wh, "w", encoding="utf-8", newline="\n") as f:
+            f.write("#!/usr/bin/env bash\nset -uo pipefail\n"
+                    'MODE_CONFIG="$1"; CONFIG_TOML="$2"; MODE_UID="$3"\n' +
+                    w_m.group(0) + "\nwrite_device_settings; echo rc=$?\n")
+        w_modes = os.path.join(TMPROOT, "w_modes.json")
+        with open(w_modes, "w", encoding="utf-8") as f:
+            json.dump({"current_active_mode": "std", "modes": [
+                {"uid": "std", "name": "hs 标准 55%",
+                 "all_device_settings": {"DEV1": {"fan3": {"speed_fixed": 55},
+                                                  "fan2": {"speed_fixed": 55}}}},
+                {"uid": "turbo", "name": "hs 强劲 100%",
+                 "all_device_settings": {"DEV1": {"fan3": {"speed_fixed": 100},
+                                                  "fan2": {"speed_fixed": 100}}}},
+                {"uid": "smart", "name": "hs 智能",
+                 "all_device_settings": {"DEV1": {"fan3": {"profile_uid": "CP"},
+                                                  "fan2": {"profile_uid": "KP"}}}}]}, f)
+
+        def run_w(cfg, uid):
+            p = os.path.join(TMPROOT, "w.toml")
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write(cfg)
+            r = subprocess.run(["bash", wh, w_modes, p, uid],
+                               capture_output=True, text=True)
+            last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+            return last, open(p, encoding="utf-8").read()
+
+        cfg0 = ('[devices]\nx = 1\n\n[device-settings."DEV1"]\n'
+                '"fan3" = { profile_uid = "CP" }\n'
+                '"fan2" = { profile_uid = "KP" }\n\n[[profiles]]\nuid = "0"\n\n'
+                '[settings]\napply_on_boot = true\n')
+
+        rc, after = run_w(cfg0, "std")
+        ok("⑪ Fixed 档写入 speed_fixed",
+           rc == "rc=0" and 'speed_fixed = 55' in after, after)
+        ok("⑫ 写入后覆盖旧的 profile_uid（不残留）",
+           'profile_uid = "CP"' not in after, after)
+        ok("⑬ 其它段（[devices]/[[profiles]]/[settings]）原样保留",
+           '[devices]' in after and '[[profiles]]' in after
+           and 'apply_on_boot = true' in after, after)
+        rc, after = run_w(cfg0, "turbo")
+        ok("⑭ 切强劲 → speed_fixed = 100",
+           'speed_fixed = 100' in after and 'speed_fixed = 55' not in after, after)
+        rc, after = run_w(cfg0, "smart")
+        ok("⑮ 切智能 → 写回 profile_uid（曲线）",
+           'profile_uid = "CP"' in after and 'speed_fixed' not in after, after)
+
+        # 端到端：write → matches 必一致
+        cm_m2 = re.search(r"config_matches_mode\(\) \{.*?\n\}\n", a4, flags=re.S)
+        if cm_m2:
+            ch2 = os.path.join(TMPROOT, "fn_cm2.sh")
+            with open(ch2, "w", encoding="utf-8", newline="\n") as f:
+                f.write("#!/usr/bin/env bash\nset -uo pipefail\n"
+                        'MODE_CONFIG="$1"; CONFIG_TOML="$2"; MODE_UID="$3"\n' +
+                        cm_m2.group(0) + "\nconfig_matches_mode; echo rc=$?\n")
+            p = os.path.join(TMPROOT, "e2e.toml")
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write(cfg0)
+            subprocess.run(["bash", wh, w_modes, p, "turbo"], capture_output=True)
+            r = subprocess.run(["bash", ch2, w_modes, p, "turbo"],
+                               capture_output=True, text=True)
+            ok("⑯ 端到端：write 之后 matches 必为 rc=0（写完即一致）",
+               r.stdout.strip() == "rc=0", r.stdout.strip())
 
 finally:
     shutil.rmtree(TMPROOT, ignore_errors=True)

@@ -13,6 +13,15 @@
 #     apply-mode.sh --scan            # ★ 列出所有 Mode + 每档当前绑定到谁
 #     apply-mode.sh --bind 5=<uid|名字> 2=…   # ★ 显式绑定档位→Mode
 #     apply-mode.sh --dry-run 3       # 只打印将要做的动作，不落盘
+#     apply-mode.sh --restart 3       # ★ 切档后额外重启 daemon（兜底，默认不重启）
+#
+# ★★ 切档如何生效（v3：直接写配置，不重启）：
+#     ① 写 modes.json 的 current_active_mode（"模式"层，UI 一致性 + 开机恢复）；
+#     ② 把该 Mode 的 all_device_settings 【直接写进 config.toml 的 [device-settings]】
+#        —— 这正是 daemon「激活 Mode」时做的事，我们自己做 ⇒ 改完立即一致；
+#     ③ daemon 监视配置文件，会自动热重载 ⇒ **无需重启**。
+#     ★ 只有在热重载不生效（老版本 daemon）时才需要 `--restart` 兜底。
+#     ★ apply_on_boot=true 仍会确保 —— 它是【断电/重启后】恢复档位的保险。
 #
 # 档位映射（与界面一致）：
 #     5 智能 → hs-smart      （CPU 通道=CPU 曲线, 机箱通道=机箱曲线）
@@ -47,7 +56,8 @@
 #     找不到重启通道时会【非 0 退出】并打印排查指引 —— 因为「写文件成功但没人
 #     重启」等于档位没生效，而症状恰好就是「屏幕切档、CoolerControl 没反应」。
 #
-# 退出码：0=成功 / 2=参数或文件问题 / 3=没有可用的重启通道 / 4=设置被改回
+# 退出码：0=成功 / 2=参数或文件问题 / 5=config.toml 与 Mode 内容不符
+#   （旧的 3/4 "无重启通道/被改回" 已不再使用 —— 切档不再依赖重启）
 # =============================================================================
 set -uo pipefail
 
@@ -59,6 +69,10 @@ export CC_MODE_CONFIG="$MODE_CONFIG"
 export CC_CONFIG_TOML="$CONFIG_TOML"
 
 DRY_RUN=0
+# ★ 默认【不重启】daemon：切档靠"直接写 config.toml"生效（daemon 自动热重载）。
+#   仅当显式 --restart 或 HIKSEMI_FAN_CC_RESTART_ON_APPLY=1 时才重启（兜底手段）。
+RESTART=0
+[ "${HIKSEMI_FAN_CC_RESTART_ON_APPLY:-0}" = "1" ] && RESTART=1
 
 log()  { printf '[fan-apply] %s\n' "$*" >&2; }
 warn() { printf '[fan-apply] WARN: %s\n' "$*" >&2; }
@@ -244,6 +258,8 @@ for a in "$@"; do
         --list)        cmd_list; exit 0 ;;
         --status)      cmd_status; exit 0 ;;
         --dry-run|-n)  DRY_RUN=1 ;;
+        --restart)     RESTART=1 ;;
+        --no-restart)  RESTART=0 ;;
         --scan)
             [ -f "$MAP_PY" ] || die "找不到 $MAP_PY"
             exec python3 "$MAP_PY" --scan ;;
@@ -450,89 +466,139 @@ open(p, "w", encoding="utf-8").write("".join(lines))
 PY
 }
 
-# 单次「写 + 重启」：★ 唯一一处落地动作，重试用同一个函数（不再复制粘贴）
+# ── ★★ 关键：把 Mode 的 all_device_settings 直接写进 config.toml ────────────
+#   daemon 真的在「激活 Mode」时做的就是这件事（把 Mode 快照写回 [device-settings]）。
+#   我们【自己写】就能：① 不依赖 daemon 重启；② 改完立即一致（⑦ 环必绿）。
+#   写的是 modes.json 里这个 Mode 的 all_device_settings，即模式内容的权威来源。
+write_device_settings() {
+    [ -f "$CONFIG_TOML" ] || return 2
+    python3 - "$MODE_CONFIG" "$CONFIG_TOML" "$MODE_UID" <<'PY'
+import json, re, sys
+mod_p, cfg_p, target = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    mj = json.load(open(mod_p, encoding="utf-8"))
+    cm = next((m for m in mj.get("modes", []) if m.get("uid") == target), None)
+    if not cm:
+        print(f"Mode {target} 不在 modes.json", file=sys.stderr); sys.exit(3)
+    ds = cm.get("all_device_settings") or {}
+    if not ds:
+        print(f"Mode {target} 的 all_device_settings 为空", file=sys.stderr); sys.exit(3)
+    txt = open(cfg_p, encoding="utf-8").read()
+except Exception as e:
+    print(f"读取失败: {e}", file=sys.stderr); sys.exit(2)
+
+def render_chan(st):
+    """把 {profile_uid: X} 或 {speed_fixed: N} 渲染成内联表。"""
+    if not isinstance(st, dict):
+        return None
+    parts = []
+    if st.get("profile_uid") not in (None, ""):
+        parts.append(f'profile_uid = "{st["profile_uid"]}"')
+    elif st.get("speed_fixed") is not None:
+        parts.append(f'speed_fixed = {int(st["speed_fixed"])}')
+    return "{ " + ", ".join(parts) + " }" if parts else None
+
+# 对每个设备，构造要写进 [device-settings.<uid>] 的通道行（保持引用引号）
+for dev, chans in ds.items():
+    rows = []
+    for ch, st in (chans or {}).items():
+        body = render_chan(st)
+        if body is None:
+            continue
+        rows.append(f'"{ch}" = {body}\n')
+    if not rows:
+        continue
+    sec_re = re.compile(
+        r'^\[device-settings\.(?:"%s"|\'%s\'|%s)\][ \t]*\n(.*?)(?=^\[|\Z)'
+        % (re.escape(dev), re.escape(dev), re.escape(dev)),
+        flags=re.M | re.S)
+    m = sec_re.search(txt)
+    new_sec = f'[device-settings."{dev}"]\n' + "".join(rows)
+    if m:
+        txt = txt[:m.start()] + new_sec + txt[m.end():]
+    else:
+        if txt and not txt.endswith("\n"):
+            txt += "\n"
+        txt += "\n" + new_sec
+
+open(cfg_p, "w", encoding="utf-8").write(txt)
+PY
+}
+
+# 单次「写 modes.json + 写 config.toml」：★ 唯一一处落地动作（重试复用）
+#   ★ 已【不再无条件重启 daemon】：daemon 会监视配置自动热重载；
+#     重启只在显式要求（--restart / HIKSEMI_FAN_CC_RESTART_ON_APPLY=1）时做。
 apply_once() {
-    # ★ 先停：daemon 运行时会保有自己的 modes/config 内存态，退出时可能把旧值刷回文件。
-    if cc_detect_ctl; then
-        if ! cc_ctl_run stop >/dev/null 2>&1; then
-            warn "stop 未成功（继续，但写入可能被退出时的刷盘覆盖）"
-        fi
-        sleep 2          # 等 daemon 真正退出并完成落盘（1s 在慢盘上不够）
-    fi
     cat "$TMP" > "$MODE_CONFIG"
     log "已设置 current_active_mode = ${MODE_UID}（档位 ${MODE_ARG}=${MODE_NAME}）"
-    restart_daemon
+    # ★★ 直接把模式内容写进 config.toml ⇒ 无需靠 daemon 重启来"应用"
+    if [ -f "$CONFIG_TOML" ]; then
+        if write_device_settings; then
+            log "已把档位内容写入 config.toml 的 [device-settings]"
+        else
+            warn "写 config.toml 的 [device-settings] 失败（模式可能未真正落地）"
+        fi
+    fi
+    if [ "$RESTART" = "1" ]; then
+        restart_daemon
+    fi
+    return 0
 }
 
 if [ "$DRY_RUN" = "1" ]; then
     log "[dry-run] 将把 current_active_mode 设为 ${MODE_UID}（${MODE_NAME}）"
+    log "[dry-run] 并将档位内容写入 config.toml 的 [device-settings]（不重启 daemon）"
     log "[dry-run] 完成（未改动任何文件）"
     rm -f "$TMP"
     exit 0
 fi
 
-# ★★ 关键一步：确保 apply_on_boot=true，否则 daemon 启动【不会】应用 active mode，
-#    结果就是 modes.json 改了、config.toml 纹丝不动（正是"模式改了配置没变"）。
+# ★ apply_on_boot 仍要确保为 true —— 它是【断电/重启后】恢复档位的保险，
+#   与「切档当下是否生效」无关（当下生效靠上面直接写 config.toml）。
 if [ -f "$CONFIG_TOML" ]; then
     if ensure_apply_on_boot; then
-        log "apply_on_boot = true 已确认（daemon 启动会应用当前 Mode）"
+        log "apply_on_boot = true 已确认（开机/daemon 重启后会恢复当前档）"
     else
         warn "无法确认/设置 apply_on_boot=true（config.toml 只读？）"
     fi
 fi
 
 apply_once; RC=$?
-sleep 2
+sleep 1
 NOW="$(read_back)"
 
-# 回读不一致 → 再落地一次（daemon 版本差异可能把文件写回；只重试一次防死循环）
-if [ "$NOW" != "$MODE_UID" ] && [ "$RC" = "0" ]; then
-    warn "回读值 ${NOW:-（空）} ≠ ${MODE_UID}（疑似被 daemon 重写）→ 重写并再重启一次"
-    apply_once; RC=$?
-    sleep 2
-    NOW="$(read_back)"
-fi
-
-# ★★ 第二重回读：config.toml 的真实设置是否已等于当前 Mode 的内容。
-#    这是「模式改了但配置没变」的直接判据 —— 只看 modes.json 是不够的。
+# ★★ 判据核心：config.toml 的真实设置是否【已等于】当前 Mode 内容。
+#    这是「模式改了但配置没变」的直接判据 —— 只看 modes.json 不算数。
 CFG_OK=2
 if [ -f "$CONFIG_TOML" ]; then
     config_matches_mode; CFG_OK=$?
     if [ "$CFG_OK" = "1" ]; then
-        warn "config.toml 与当前 Mode【不一致】⇒ 档位没真正落到配置"
-        warn "  ⇒ 强制再应用一次（stop → 写 → start）"
+        warn "config.toml 与当前 Mode【不一致】→ 再写一次"
         apply_once; RC=$?
-        sleep 2
-        NOW="$(read_back)"
         config_matches_mode; CFG_OK=$?
     fi
 fi
 rm -f "$TMP"
 
 if [ "$NOW" = "$MODE_UID" ]; then
-    log "确认生效：current_active_mode = $NOW"
+    log "确认：current_active_mode = $NOW"
 else
     warn "回读值 ${NOW:-（空）} ≠ ${MODE_UID}"
 fi
 
-# 成功判据：配置写入 + daemon 重启成功（否则档位不会真正生效）
-[ -f "$CONFIG_TOML" ] || warn "未找到 $CONFIG_TOML（可能尚未安装）"
-if [ "$RC" != "0" ]; then
-    warn "档位【未真正生效】：配置已写入，但没有可用的重启通道。"
-    warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync"
-    exit 3
+# ─── 简洁判据（★ 不再以"能不能重启 daemon"论成败）────────────────────────
+if [ ! -f "$CONFIG_TOML" ]; then
+    warn "未找到 $CONFIG_TOML（CoolerControl 未安装？）—— 已只写 modes.json"
+    exit 0
 fi
-if [ "$NOW" != "$MODE_UID" ]; then
-    warn "档位可能未生效（current_active_mode 被改回）。"
-    warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync"
-    exit 4
+if [ "$CFG_OK" = "0" ]; then
+    log "档位切换完成：${MODE_ARG}(${MODE_NAME}) → ${MODE_UID}（config.toml 已同步）"
+    exit 0
 fi
-if [ "$CFG_OK" = "1" ]; then
-    warn "★ current_active_mode 已是 ${MODE_UID}，但 config.toml 仍与 Mode 内容不符。"
-    warn "  可能：① apply_on_boot 仍非 true（daemon 未在启动时应用）"
-    warn "        ② Mode 的 all_device_settings 引用了 daemon 不认识的设备/通道"
-    warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync   # 看 ⑦ 环"
-    exit 5
-fi
-log "档位切换完成：${MODE_ARG}(${MODE_NAME}) → ${MODE_UID}"
-exit 0
+# CFG_OK=1/2 ⇒ config.toml 没跟上
+warn "★ config.toml 与 Mode 内容不符（档位可能没真正生效）。"
+warn "  ① 检查是否含 @DEVICE_UID@ 等占位符残留 ⇒ render-config.py --auto 重渲"
+warn "  ② 确认 Mode 的通道名是 daemon 认识的（fanN，非 pwmN）"
+warn "  ③ 兜底：加 --restart 让 daemon 重启并按 active mode 重写"
+warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync   # 看 ⑦ 环"
+exit 5

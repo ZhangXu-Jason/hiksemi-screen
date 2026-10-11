@@ -128,7 +128,7 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
         fi
     fi
 
-    SEC "④ 重启通道（改完配置要有人重启 daemon 才生效）"
+    SEC "④ 重启通道（★ 默认切档【不重启】；此项仅 --restart 兜底时才需要）"
     FOUND=0
     if command -v systemctl >/dev/null 2>&1; then
         U="$(systemctl list-unit-files --type=service --plain --no-legend 2>/dev/null \
@@ -153,8 +153,8 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     fi
     if [ "$FOUND" = "0" ]; then
         NG "既没找到 systemd 服务也没找到 docker 容器
-      ⇒ apply-mode.sh 只能写文件、重启不了 ⇒ 切档【不会生效】
-      ⇒ 屏幕会表现为「切了没反应」。修法（任选其一）：
+      ⇒ 若用 --restart 兜底则无法重启；默认路径（直接写 config.toml）不受影响。
+      ⇒ 需要兜底时修法（任选其一）：
          export HIKSEMI_FAN_CC_RESTART='docker restart <容器名>'
          （写进 hiksemi-sub.service 的 Environment=，
            或直接在中间件用 HIKSEMI_FAN_APPLY_CMD 指定整条命令）"
@@ -298,10 +298,11 @@ if mismatch == 0:
     ok("config.toml 的 [device-settings] 与当前 Mode 内容一致（已真正生效）")
 else:
     ng(f"有 {mismatch} 处不一致 ⇒ 档位【没真正落到 config.toml】")
-    info("  ① 先看 daemon 是否重启成功（④ 环）")
-    info("  ② 再确认 apply_on_boot：config.toml 的 [settings] apply_on_boot 必须 = true")
-    info("     否则 daemon 启动时不会应用 active mode（改了 modes.json 也不落地）")
-    info("  ③ 若配置里有 @DEVICE_UID@ 等占位符残留 ⇒ 重新渲染（--auto）")
+    info("  ① 若 apply-mode.sh 不是新版（切档应直接写 config.toml）⇒ 同步工具目录")
+    info("     新版 apply-mode.sh 落地时会【自己写 config.toml】，不依赖重启 daemon")
+    info("  ② 确认 apply-mode.sh 返回 5（写 config.toml 失败）时的告警原因")
+    info("  ③ 若配置里有 @DEVICE_UID@ 等占位符残留 ⇒ render-config.py --auto 重渲")
+    info("  ④ 兜底：apply-mode.sh --restart <mode>（让 daemon 重启并按 active mode 重写）")
 PY
     else
         INFO "缺少 python3 或 fan-mode-map.py，跳过"
@@ -315,7 +316,7 @@ PY
     INFO "        （例如「hs 低速 25%」里居然是 hs-standard=60%）"
     INFO "        ⇒ 修：render-config.py --auto --merge-modes <modes.json> --rename-modes"
     INFO "  · ③ 有 NG        → 反向档位识别不出，需 --bind"
-    INFO "  · ④ 有 NG        → 重启通道缺失，切档只写文件不生效"
+    INFO "  · ④ 有 NG        → 无重启通道（仅 --restart 兜底时才需要；默认切档不重启）"
     INFO "  · ⑤ 有 NG        → 改了中间件没重启"
     INFO "  · ⑥ 有 NG        → 反向同步/规则模块缺失 ⇒ 屏幕切档会自己弹回"
     INFO "  · ⑦ 有 NG        → 模式改了但 config.toml 没跟上（档位没真正生效）"

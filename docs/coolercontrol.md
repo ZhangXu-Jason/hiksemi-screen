@@ -77,21 +77,30 @@ CoolerControl 的配置文件即可。
 middleware.py  resolve_set_hardware()          ← 只认 fan_mode，返回 {"code":0}
    │  ctx["fan"].update(4)                     ← 状态落 /var/lib/hiksemi-sub/fan.json
    ▼
-apply_to_external_app(prev, state)             ← 优先级：CMD > CoolerControl > sysfs PWM
+apply_to_external_app(state)                   ← 优先级：CMD > CoolerControl > sysfs PWM
    │  环境变量 HIKSEMI_FAN_COOLERCONTROL=1
    │  执行 coolercontrol/apply-mode.sh 4
    ▼
-apply-mode.sh 4
+apply-mode.sh 4                                ← ★ v3：直接写配置，默认【不重启】
    │  ① 原子改 modes.json: current_active_mode = "hs-high"
    │      （同时把旧值写进 previous_active_mode）
-   │  ② 重启 coolercontrold（systemd 或 docker，自动探测）
+   │  ② ★ 把该 Mode 的 all_device_settings 【直接写进】
+   │      config.toml 的 [device-settings.<uid>]（daemon 激活 Mode 时做的就是这件事）
    ▼
-CoolerControl daemon 启动
-   │  读 modes.json → activate_mode("hs-high")
-   │  把该 Mode 的 Setting 写回 config.toml 的 [device-settings] 并应用引擎
+CoolerControl daemon 监视到 config.toml 变化 → 重新应用 [device-settings]
    ▼
-风扇 PWM = 100%（新档位在 < 2s 内生效）
+风扇 PWM = 100%（新档位 < 1s 内生效，无需重启）
 ```
+
+> ★★ **v3 为何改为「直接写 config.toml + 不重启」**（2026-10-11）：
+> 旧的「改 modes.json → 重启 daemon」路径有三个毛病：① 每次切档都重启 daemon，
+> 重且慢、还会让风扇短暂掉到开机默认；② 依赖 daemon 启动时 `activate_mode` 成功
+> （`apply_on_boot` 位置/取值不对就整条链路失效）；③ 中间件与 daemon **两个进程
+> 竞争写同一个文件**，先后不确定。现改为中间件**自己算好并写下生效面**
+> （`config.toml` 的 `[device-settings]`），daemon 只需热重载 ⇒ 切档幂等、
+> 不依赖 daemon 行为，且 probe ⑦ 环必然一致。
+> **兜底**：若某些 daemon 版本不热重载配置，加 `--restart`（或
+> `HIKSEMI_FAN_CC_RESTART_ON_APPLY=1`）即回到「重启」路径。
 
 **回读**：档位回显走的是状态帧 `fanmode` 字段，由 `FanState.mode()` 提供，
 与 CoolerControl 无关 —— 也就是说**即使 CoolerControl 未安装**，
@@ -589,34 +598,38 @@ sudo ./probe-coolercontrol.sh watch 30
 （切成目标 Mode），但 `config.toml` 的 `[device-settings]` 内容**却退回/停在旧档**，
 于是「模式（modes.json）」与「实际生效配置（config.toml）」对不上。
 
-**根因**：CoolerControl daemon 只有在 `config.toml` 的 `[settings] apply_on_boot = true`
-时，才会在**启动时**读取 `modes.json` 的 `current_active_mode` 并应用它。
-若该键为 `false`（或被 daemon/升级重写掉），daemon 启动后**不应用** active mode ——
-`modes.json` 改了、`config.toml` 纹丝不动，症状与"切档没生效"完全一样。
+**根因（两层）**：
 
-> ★ `apply_on_boot` 属于 **`[settings]` 段**，不是顶层键。若把它写到文件头
-> （第一个 `[section]` 之前），TOML 会当成顶层键 ⇒ daemon 读不到 ⇒ 看似"修了"实则无效。
-> 这是本类 bug 最隐蔽的坑：**改是改了，但放错了段**。
+1. **路径本身是错的。** 旧设计只写 `modes.json`，指望去**重启 daemon** 让它
+   `activate_mode()` 把 Setting 写回 `config.toml`。但这条路有硬伤：
+   daemon 只在 `[settings] apply_on_boot = true` 时才会在启动时应用 active mode；
+   该键为 `false`（或被 daemon/升级重写）⇒ 重启也白重启。而且中间件与 daemon
+   **两个进程竞争写同一个文件**，谁先谁后不确定；每次切档都重启也很重。
+2. **`apply_on_boot` 必须写在 `[settings]` 段**，不是顶层键。写到文件头
+   （第一个 `[section]` 之前）⇒ TOML 当成顶层键 ⇒ daemon 读不到 ⇒「看着修了其实没修」。
 
-**修复**（`apply-mode.sh`）：
+**修复（v3 —— 换掉整条路径，而不是给旧路径打补丁）**：
+中间件**直接写生效面**，不再依赖 daemon 重启：
 
-1. **`ensure_apply_on_boot()`** —— 落地前确保 `[settings]` 段内 `apply_on_boot = true`：
-   - 段内已有该键 → 就地改 `true`；
-   - 有 `[settings]` 但无该键 → **插到段头之后**（段内首行）；
-   - 连 `[settings]` 段都没有 → 文件末尾追加一个 `[settings]` 段；
-   - 注释里的 `apply_on_boot` 文本**不误判**；操作**幂等**。
-2. **`config_matches_mode()`** —— 第二重回读：解析 `config.toml` 的
-   `[device-settings.<uid>]` 段，逐通道对比当前激活 Mode 的 `all_device_settings`
-   （`profile_uid` / `speed_fixed`）。返回 `0`=一致 / `1`=不一致 / `2`=无法判定。
-   - ★ 段头两种写法（`[device-settings."uid"]` 与 `[device-settings.uid]`）都要认，
-     通道行 `"fan3" = { ... }` 的**引号也必须容忍** —— 否则会误报"不一致"（假阴性）。
-   - 空 Mode（`all_device_settings` 为空）视为**不一致**：激活它不会改任何设置。
-3. **主流程加固**：`ensure_apply_on_boot` → `apply_once` → `sleep 2` → 回读
-   `current_active_mode` → 不一致则强制再 `apply_once` → **第二重回读 `config_matches_mode`**
-   → 若仍不符则**强制再应用一次**。
-4. **退出码 5**：`current_active_mode` 已对、但 `config.toml` 仍与 Mode 内容不符 ⇒
-   明确告警（可能 `apply_on_boot` 未生效，或 Mode 引用了 daemon 不认识的设备/通道），
-   并指向 probe ⑦ 环。
+1. **`write_device_settings()`** —— 把当前 Mode 的 `all_device_settings`
+   **直接写进 `config.toml` 的 `[device-settings.<uid>]`**（daemon 激活 Mode 时做的正是
+   这件事，中间件自己做）。逐通道渲染 `profile_uid` 或 `speed_fixed` 内联表，
+   只替换 `[device-settings]` 段，其它段原样保留。**写完即一致。**
+2. **默认不重启**。`apply_once` = 写 `modes.json` + 写 `config.toml`；
+   `RESTART=1`（`--restart` 或 `HIKSEMI_FAN_CC_RESTART_ON_APPLY=1`）时才额外重启（兜底）。
+3. **`ensure_apply_on_boot()`** —— 仍确保 `[settings]` 段内 `apply_on_boot = true`
+   （作为**断电/重启后**恢复档位的保险；与切档当下是否生效无关）：
+   - 段内已有该键 → 就地改 `true`；有段无键 → 插到**段头之后**；无段 → 末尾追加；
+   - 注释里的同名文本**不误判**；操作**幂等**。
+4. **`config_matches_mode()`** —— 落地后回读 `config.toml` 的 `[device-settings.<uid>]`，
+   逐通道比对当前 Mode 内容（`0`=一致 / `1`=不一致 / `2`=无法判定）。
+   - ★ 段头 `[device-settings."uid"]` 与通道行 `"fan3" = { ... }` 的**引号都要容忍**，
+     否则误报"不一致"（假阴性 —— 第一版就踩了）。
+   - 空 Mode（`all_device_settings` 为空）视为**不一致**：激活它不改任何设置。
+5. **退出码 5**：写完仍不符（占位符残留 / 通道名 daemon 不认识）⇒ 明确告警并指向 ⑦ 环。
+
+> ★★ **教训**：与其给"改 A 文件 + 重启 B 进程"的间接路径打补丁，不如**直接写生效面**。
+> 间接路径的每一环（重启成功？apply_on_boot 生效？两进程竞争？）都是潜在故障点。
 
 **取证（一条命令，看 ⑦ 环）**：
 
@@ -625,10 +638,10 @@ sudo ./probe-coolercontrol.sh sync
 ```
 
 `sync` 的 **⑦ 环**「config.toml 与当前 Mode 是否一致」会逐通道打印
-`config.toml=…  ≠  Mode=…`，并提示检查 `apply_on_boot` / 占位符残留。
+`config.toml=…  ≠  Mode=…`，并提示同步新版脚本 / 重渲配置 / 用 `--restart` 兜底。
 
-**退出码总表**：`0`=成功 / `2`=参数或文件问题 / `3`=无重启通道 /
-`4`=`current_active_mode` 被改回 / `5`=`config.toml` 与 Mode 内容不符。
+**退出码总表**：`0`=成功 / `2`=参数或文件问题 / `5`=`config.toml` 与 Mode 内容不符。
+（旧的 `3`/`4` 已废弃 —— 切档不再依赖重启。）
 
 ## 7. 为什么用「改文件 + 重启」而不是调 REST API
 
@@ -636,8 +649,9 @@ CoolerControl 的 REST API 需要处理 token / 会话，且路径随版本变�
 对中间件来说是额外的耦合。而：
 
 - 切换风扇档位是**低频操作**（人工在 2.86" 小屏上点一下）；
-- 改 `modes.json` + 重启是**幂等、可离线回放、可手工复现**的路径；
-- daemon 启动耗时 < 2s，风扇短暂回到开机默认后立刻应用新档，体感可接受。
+- 改配置文件是**幂等、可离线回放、可手工复现**的路径；
+- ★ v3 起**默认不再重启**：直接写 `config.toml` 由 daemon 热重载，切档 < 1s、不中断风扇；
+  只有 `--restart` 兜底路径才重启（< 2s，风扇短暂回开机默认后立刻应用新档）。
 
 ⇒ 因此 `apply-mode.sh` 走文件路径。若日后确实需要免重启切换，
 可在此基础上补一个调 API 的分支，**中间件侧接口不需要任何改动**。

@@ -64,7 +64,7 @@ CoolerControl daemon 启动 → activate_mode("hs-high")
 | `config.toml` | **模板**。Profiles + Functions + device-settings + settings，含 `@DEVICE_UID@` 等占位符 |
 | `modes.json` | **模板**。4 个 Mode 快照（均双通道），含占位符 |
 | `render-config.py` | 占位符渲染 + TOML/JSON 契约自校验 + 原子写 + 备份；支持双风扇/单风扇/降级 |
-| `apply-mode.sh` | **中间件调用的落地脚本**。`apply-mode.sh {5\|2\|3\|4}` |
+| `apply-mode.sh` | **中间件调用的落地脚本**。`apply-mode.sh {5\|2\|3\|4}`（★ v3：直接写 `config.toml`，**默认不重启** daemon；`--restart` 兜底） |
 | `fan-tier.py` | ★★ **档位规则的唯一权威来源**（其他脚本都 import 它，规则只此一份）。可当 CLI：`--uids` / `--keys` / `--tier N` / `--self-test` |
 | `fan-mode-map.py` | 档位 ↔ Mode 映射解析的**薄封装**（规则委托 `fan-tier.py`）：`--scan` / `--bind` / `--resolve` / `--reverse` |
 | `hs-fan-mode-map.json` | 渲染时一并生成的绑定文件（4 档 → `hs-*` uid）；`--bind` 改写它 |
@@ -228,25 +228,32 @@ sudo grep -i 'fan' /var/log/hiksemi-sub/kiosk.log
 - `ExponentialMovingAvg` 类型已在 4.4.0 移除，读到会静默转 `Identity`。
 - 保留 uid：Profile `"0"` = Unmanaged，Function `"0"` = Default Function；
   缺失时 daemon 会自动补写。
-- `activate_mode()` 会把 Mode 的 Setting 写回 `config.toml` 并对
+- `activate_mode()` 会把 Mode 的 Setting 写回 `config.toml`，并对
   **Mode 未覆盖的 channel 做 Reset**，因此改 `modes.json` 的
   `current_active_mode` 后重启 daemon 即生效。
+- ★★ **v3（2026-10-11）：切档不再依赖重启。** `apply-mode.sh` 落地时
+  **自己把 Mode 的 `all_device_settings` 写进 `config.toml` 的 `[device-settings]`**
+  ——这正是 daemon「激活 Mode」时做的事，中间件自己做 ⇒ 改完立即一致（probe ⑦ 必绿），
+  daemon 只需热重载。这消除了旧路径的三个毛病：每次切档重启 daemon／依赖 daemon
+  启动时 `activate_mode` 环境正确／两进程竞争写同一文件。
+  ★ 兜底：daemon 若不热重载配置，用 `apply-mode.sh --restart <mode>`
+  （或 `HIKSEMI_FAN_CC_RESTART_ON_APPLY=1`）。
 - `apply_on_boot = true` 时，daemon 启动会重新应用 `[device-settings]`。
   ★ **必须在 `[settings]` 段内**（放文件头 = 顶层键 = daemon 读不到）；
   `apply-mode.sh` 落地前会用 `ensure_apply_on_boot()` 自动确保它在正确位置。
-  ★ 若为 `false`，改 `modes.json` 后 `config.toml` **不会跟着变** —— 这正是
-  「模式改了、配置文件却没变」的根因。
-- `apply-mode.sh` 落地后做**第二重回读**：`config_matches_mode()` 解析 `config.toml`
-  的 `[device-settings.<uid>]`，逐通道比对当前 Mode 内容；不符则强制重应用一次，
-  仍不符则以 **`exit 5`** 告警（指向 `probe-coolercontrol.sh sync` 的 ⑦ 环）。
+  ★ 它是【断电/重启后】恢复档位的保险（与切档当下是否生效无关）。
+- `apply-mode.sh` 落地后回读 `config.toml`：`config_matches_mode()` 逐通道比对
+  当前 Mode 内容；不符则再写一次，仍不符以 **`exit 5`** 告警
+  （指向 `probe-coolercontrol.sh sync` 的 ⑦ 环）。
 
-**退出码**：`0`=成功 / `2`=参数或文件问题 / `3`=无重启通道 /
-`4`=`current_active_mode` 被改回 / `5`=`config.toml` 与 Mode 内容不符。
+**退出码**：`0`=成功 / `2`=参数或文件问题 / `5`=`config.toml` 与 Mode 内容不符。
+（旧的 `3`=无重启通道 / `4`=被改回 已废弃 —— 切档不再依赖重启。）
 
 ## 注意事项
 
-- **重启代价**：切换档位会重启 daemon（< 2s），风扇会短暂回到开机默认后
-  立刻应用新档。若不能接受，可改用 CoolerControl REST API（需处理 token）。
+- **切换代价（v3 起极低）**：切档 = 写 `modes.json` + 写 `config.toml`，
+  由 daemon 热重载，**不重启、风扇不中断**（< 1s）。仅 `--restart` 兜底路径才会重启
+  （< 2s，风扇短暂回开机默认后立刻应用新档）。
 - **多风扇（本机默认双风扇）**：本机 it8613 的可控通道是 `fan3`(CPU) + `fan2`(机箱)，
   两条曲线各管一路。渲染时用 `--cpu-channel` / `--case-channel` 指定；
   **每个 Mode 必须覆盖全部通道**，否则未覆盖的会被 Reset（渲染器会强制校验）。
