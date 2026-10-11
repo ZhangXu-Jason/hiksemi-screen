@@ -10,7 +10,8 @@
 #     sudo ./probe-coolercontrol.sh modes      # ★ 诊断「Mode 在 UI 里内容为空」
 #         （比对 daemon 真值设备表 / modes.json 引用的 UID / 通道 / profile）
 #     sudo ./probe-coolercontrol.sh sync       # ★★ 诊断「屏幕 ↔ CoolerControl 不同步」
-#         （工具版本 / 档位绑定 / 反向档位 / 重启通道 / 中间件是否已重启）
+#         （工具版本 / 档位绑定 / 反向档位 / 重启通道 / 中间件是否已重启 / 自我回滚防护）
+#     sudo ./probe-coolercontrol.sh watch      # ★★ 实时盯 modes.json 变化（抓"切了又弹回"）
 #     CC_DIR=/path ./probe-coolercontrol.sh modes   # 配置目录不在 /etc/coolercontrol 时
 # =============================================================================
 set +e
@@ -23,13 +24,60 @@ OK()  { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 NG()  { printf '  \033[31m✗\033[0m %s\n' "$*"; }
 INFO(){ printf '  · %s\n' "$*"; }
 
+# ── 0.0b watch 分支：★ 实时盯 modes.json 的 current_active_mode，抓自我回滚 ──
+#   用法：sudo ./probe-coolercontrol.sh watch [秒数，默认 30]
+#   在屏幕上切一次档，观察这里打印的序列：
+#     正常 →  3 → 2（切成低速后就停在 2）
+#     自我回滚 → 3 → 2 → 3（切过去又弹回来了，说明反向同步把它覆盖了）
+if [ "${1:-}" = "watch" ] || [ "${1:-}" = "--watch" ]; then
+    CC_DIR="${CC_DIR:-/etc/coolercontrol}"
+    MODES="$CC_DIR/modes.json"
+    MAP="$CC_DIR/hs-fan-mode-map.json"
+    SECS="${2:-30}"
+    [ -f "$MODES" ] || { echo "找不到 $MODES"; exit 1; }
+    PYBIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null)"
+    rev_name() {  # uid → 屏幕档位（用映射反查）
+        [ -n "$PYBIN" ] && [ -f "$MAP" ] && \
+            CC_MODE_CONFIG="$MODES" CC_FAN_MODE_MAP="$MAP" \
+            "$PYBIN" -c "
+import json,os,sys
+d=json.load(open(os.environ['CC_MODE_CONFIG'],encoding='utf-8'))
+cur=d.get('current_active_mode')
+name=next((m.get('name') for m in d.get('modes',[]) if m.get('uid')==cur),'?')
+print(f\"{cur}  ({name})\")" 2>/dev/null
+    }
+    echo "★ 实时监视 $MODES 的 current_active_mode（${SECS}s）"
+    echo "  现在去小彩屏上切一次风扇档位，观察下面的序列。"
+    echo "  正常     : 3 → 2（停在 2）"
+    echo "  自我回滚 : 3 → 2 → 3（弹回去了 = 本 bug）"
+    echo "──────────────────────────────────────────────────────"
+    LAST=""
+    i=0
+    while [ "$i" -lt "$SECS" ]; do
+        NOW="$(rev_name)"
+        if [ "$NOW" != "$LAST" ]; then
+            printf '  %s  →  %s\n' "$(date '+%H:%M:%S')" "$NOW"
+            LAST="$NOW"
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "──────────────────────────────────────────────────────"
+    echo "若出现「3 → 2 → 3」："
+    echo "  ① 确认中间件是新版： bash $0 sync  （看 ⑥ 环）"
+    echo "  ② 若 ⑥ 环 NG → 重跑安装器并重启 hiksemi-sub"
+    exit 0
+fi
+
 # ── 0.0 sync 分支：★ 「屏幕 ↔ CoolerControl 不同步」一次性取证 ─────────────
 #   症状：屏幕切档 CC 没反应 / 在 CC UI 里切模式屏幕不跟 / 新建模式后失联。
-#   链条有四环，任一环断都会表现成"不同步"，逐环查：
+#   链条有六环，任一环断都会表现成"不同步"，逐环查：
 #     ① 工具是不是新版（旧脚本 = 修了也没用）
 #     ② 档位能不能解析出 Mode（绑定）
 #     ③ 改完配置有没有人去重启 daemon（重启通道存在吗）
 #     ④ 中间件有没有重启（反向同步是新代码，跑着旧进程就不会生效）
+#     ⑤ 中间件是否已重启（反向同步是新代码，跑旧进程就不生效）
+#     ⑥ 自我回滚防护（★ 屏幕切档后自己弹回去的根因）
 if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     CC_DIR="${CC_DIR:-/etc/coolercontrol}"
     HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -141,6 +189,36 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
         fi
     fi
 
+    SEC "⑥ 自我回滚防护（★ 屏幕切档后自己弹回去的根因）"
+    MW="$(dirname "$HERE")/middleware/middleware.py"
+    if [ ! -f "$MW" ]; then
+        INFO "找不到 middleware.py，跳过"
+    else
+        if grep -q "_cc_mark_self_write" "$MW" 2>/dev/null; then
+            OK "中间件已含自我回滚防护（_cc_mark_self_write）"
+        else
+            NG "中间件【缺】自我回滚防护 ⇒ 屏幕切档后会被反向同步弹回原档"
+            NG "  症状：屏幕变一下、1~3 秒后又变回去；probe ③ 环永远不变"
+            INFO "修：同步新版 middleware.py 并重启："
+            INFO "    sudo bash $(dirname "$HERE")/install-autostart.sh --fan-coolercontrol on"
+            INFO "    sudo systemctl restart hiksemi-sub"
+        fi
+        if grep -q "_cc_in_self_write_window" "$MW" 2>/dev/null; then
+            OK "自写窗口判定已就位（读到刚下发的档位不回滚）"
+        fi
+        # 窗口秒数（可调）
+        SVC=/etc/systemd/system/hiksemi-sub.service
+        if [ -f "$SVC" ] && grep -q "HIKSEMI_FAN_CC_SELF_WRITE_SEC" "$SVC"; then
+            INFO "自写窗口已自定义: $(grep -o 'HIKSEMI_FAN_CC_SELF_WRITE_SEC=[^ ]*' "$SVC" | head -1)"
+        else
+            INFO "自写窗口 = 默认 12s（够覆盖 daemon 重启；一般无需改）"
+        fi
+        # ★ 反向同步是否真的在读 modes.json（中间件启用态）
+        if [ -f "$SVC" ] && grep -q 'HIKSEMI_FAN_COOLERCONTROL=1' "$SVC"; then
+            OK "反向同步已启用（HIKSEMI_FAN_COOLERCONTROL=1）"
+        fi
+    fi
+
     echo
     INFO "把上面整段输出贴给排障方即可定位。常见结论："
     INFO "  · ① 有 NG        → 脚本没同步到真机（重跑安装器，已改为内容比对同步）"
@@ -151,6 +229,7 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     INFO "  · ③ 有 NG        → 反向档位识别不出，需 --bind"
     INFO "  · ④ 有 NG        → 重启通道缺失，切档只写文件不生效"
     INFO "  · ⑤ 有 NG        → 改了中间件没重启"
+    INFO "  · ⑥ 有 NG        → 中间件缺自我回滚防护 ⇒ 屏幕切档会自己弹回（本次修复项）"
     exit 0
 fi
 

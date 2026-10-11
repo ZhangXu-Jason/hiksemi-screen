@@ -59,7 +59,7 @@ DEFAULT_KEY = os.path.join(BASE, "key.pem")
 
 # ★ 版本号：每次有行为变更就递增。日志启动段会打印，
 #   用于判断「真机上跑的是哪一版」——排查"改了没生效"时第一眼就看它。
-MIDDLEWARE_VERSION = "2026.10.05-h（散热风扇 4 档：加载/修改/保存 + CoolerControl 落地）"
+MIDDLEWARE_VERSION = "2026.10.11-a（散热风扇：CoolerControl 双向同步 + 自我回滚防护）"
 
 
 def _code_fingerprint():
@@ -1629,6 +1629,8 @@ CC_MODE_CONFIG_ENV = "CC_MODE_CONFIG"
 CC_FAN_MODE_MAP_ENV = "CC_FAN_MODE_MAP"
 CC_MODES_DEFAULT = "/etc/coolercontrol/modes.json"
 CC_MAP_FILENAME = "hs-fan-mode-map.json"
+# ★ 自写抑制窗口秒数（默认 12）；排障可调小/调 0 关闭该机制
+CC_SELF_WRITE_ENV = "HIKSEMI_FAN_CC_SELF_WRITE_SEC"
 # 渲染器产出的默认 uid（★ 必须与 fan-mode-map.py 的 DEFAULT_UIDS 一致）
 CC_DEFAULT_MODE_UIDS = {5: "hs-smart", 2: "hs-low",
                         3: "hs-standard", 4: "hs-high"}
@@ -1747,12 +1749,21 @@ class FanState:
                 with self._lock:
                     cur = int(self._data.get("fan_mode", FAN_MODE_DEFAULT))
                     if ext != cur:
-                        self._data["fan_mode"] = ext
-                        self._save_locked()
-                        log(f"[fan] 检测到 CoolerControl 侧手动切换："
-                            f"{cur}（{FAN_MODES.get(cur, '?')}）→ "
-                            f"{ext}（{FAN_MODES.get(ext, '?')}），小屏回显已同步",
-                            level="quiet")
+                        # ★★ 关键：区分【自己刚写的】与【用户在 CC UI 手切的】
+                        #   若正处于自写窗口内且读回值 == 我们刚下发的目标档位，
+                        #   说明这是「屏幕切档 → apply → daemon 重写 modes.json」
+                        #   的余波，【绝不能】拿它覆盖本地状态（否则自我回滚）。
+                        sw = _CC_SELF_WRITE["mode"]
+                        if sw is not None and ext == sw and _cc_in_self_write_window():
+                            log(f"[fan] 反向同步跳过（自写窗口内读到刚下发的 "
+                                f"{ext}，非外部切换）", level="debug")
+                        else:
+                            self._data["fan_mode"] = ext
+                            self._save_locked()
+                            log(f"[fan] 检测到 CoolerControl 侧手动切换："
+                                f"{cur}（{FAN_MODES.get(cur, '?')}）→ "
+                                f"{ext}（{FAN_MODES.get(ext, '?')}），小屏回显已同步",
+                                level="quiet")
         return int(self.get().get("fan_mode", FAN_MODE_DEFAULT))
 
     def update(self, fan_mode):
@@ -1766,6 +1777,11 @@ class FanState:
         log(f"[fan] 档位已保存 fan_mode={new_mode}"
             f"（{FAN_MODES.get(new_mode, '未知')}）"
             f"{'（未变化）' if prev == new_mode else f'（原 {prev}）'}", level="quiet")
+        # ★★ 自我回滚防护：在触发外部落地【之前】先打上自写标记，
+        #   这样 apply-mode.sh 写 modes.json、daemon 重启期间/
+        #   之后的状态帧反向同步读到目标档位时，会判定为"自己写的"而不回滚。
+        if _coolercontrol_enabled():
+            _cc_mark_self_write(new_mode)
         # ★ 外部应用落地（无论是否变化都重放一次，保证与系统一致）
         apply_to_external_app(prev, state)
         return state, prev != new_mode
@@ -1790,6 +1806,38 @@ def _coolercontrol_enabled():
 
 # mtime 缓存：状态帧每秒都会调，只在文件真变了才重新解析
 _CC_REV_CACHE = {"sig": None, "mode": None}
+
+# ★★ 自写抑制窗口：避免「屏幕切档 → 写 modes.json → 反向同步读回刚写的值
+#   → 认为 CC 侧手动切换 → 把我们的改动当成外部改动」这条自我回滚链。
+#   （症状：屏幕切到低速后自己弹回标准，probe ③ 环永远不变）
+#   机制：update() 写 modes.json 前先记录「本次要落地的目标档位」，随后在一段
+#   时间窗内，反向同步读到与目标一致的值就直接判定为"自己刚写的"、不再改写本地
+#   状态；读到【不同】的值才认为是用户在 CC UI 手动切的，允许同步。
+#   ★ 不用"忽略一次写入"的计数法（客户端可能连点、状态帧每秒来，次数极难对齐），
+#     时间窗更稳；窗口 = 单帧轮询间隔(2s) 的若干倍，覆盖 apply-mode.sh 重启 daemon
+#     后 modes.json 被 daemon 重写的整个窗口（实测 3~8s）。
+_CC_SELF_WRITE = {"mode": None, "until": 0.0}
+CC_SELF_WRITE_WINDOW = 12.0        # 秒；可用环境变量调，见 HIKSEMI_FAN_CC_SELF_WRITE_SEC
+
+
+def _cc_self_write_window():
+    v = os.environ.get(CC_SELF_WRITE_ENV, "").strip()
+    if v:
+        try:
+            return max(0.0, float(v))
+        except ValueError:
+            pass
+    return CC_SELF_WRITE_WINDOW
+
+
+def _cc_mark_self_write(mode):
+    """记录「本进程中刚把 modes.json 写成 mode」，供反向同步判定自我回滚。"""
+    _CC_SELF_WRITE["mode"] = int(mode)
+    _CC_SELF_WRITE["until"] = time.time() + _cc_self_write_window()
+
+
+def _cc_in_self_write_window():
+    return time.time() < _CC_SELF_WRITE["until"]
 
 
 def _cc_paths():

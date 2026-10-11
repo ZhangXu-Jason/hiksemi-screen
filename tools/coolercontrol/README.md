@@ -138,7 +138,9 @@ sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 \
 #
 # ★ 屏幕切档没反应 / 「选了低速却是 60%」→ 先诊断：
 #     sudo ./fan-mode-map.py --scan        # 每档绑定到谁 + 内容与档位是否相符
-#     sudo ./probe-coolercontrol.sh sync   # 五环取证（工具版本/绑定/反向/重启通道/中间件）
+#     sudo ./probe-coolercontrol.sh sync   # 六环取证（工具版本/绑定/反向/重启通道/中间件/自我回滚防护）
+#     sudo ./probe-coolercontrol.sh watch 30   # ★ 实时盯 modes.json，抓「切了又弹回」
+#         （正常 3→2 停在 2；自我回滚 3→2→3，见 docs/coolercontrol.md §6.8）
 
 # 渲染开关：
 #   --single-channel    单风扇机器（只渲染一路）

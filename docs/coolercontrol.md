@@ -234,6 +234,7 @@ sudo systemctl daemon-reload && sudo systemctl restart hiksemi-sub
 | 14 | ★ **Mode 的 uid 可能被换成随机 UUID** | 在 Web UI 里手工新建的 Mode，uid 是 `1a700658-…` 这种 UUID，不是 `hs-smart`。`apply-mode.sh` 找不到目标 uid 时会**按名字前缀回退匹配**（`hs 智能/低速/标准/强劲`），但推荐直接用渲染产物的语义 uid |
 | 15 | ★★ **Mode 名字 ≠ Mode 内容** | daemon 只认内容（`profile_uid`），名字纯展示。真机出现过「名字 `hs 低速 25%`、内容却挂 `hs-standard`(60%)」⇒ 屏幕切「低速」实际跑 60%，看起来像切档无效。判别 = `fan-mode-map.py --scan`（会标红「内容与档位不符」）；修复 = `render-config.py --auto --merge-modes <modes.json> --rename-modes`（详见 §6.7） |
 | 16 | ★★ **重启通道必须模糊匹配** | daemon 可能是 systemd 服务，也可能是 docker 容器，**名字都可能被编排工具改掉**（`coolercontrol-1` / compose 前缀 / 自定义）。只精确匹配固定名字 ⇒ 「配置文件写成功、但没人重启」⇒ 切档不生效（症状 = 屏幕与 CC 不同步）。`apply-mode.sh` 现在按 `-i coolercontrol` 模糊匹配 systemd 单元与 docker 容器，并支持 `HIKSEMI_FAN_CC_RESTART` 指定任意重启命令；**找不到重启通道时非 0 退出**（不再假装成功） |
+| 17 | ★★ **反向同步必须防"自我回滚"** | 中间件既写 `modes.json`（屏幕→CC）又读它（CC→屏幕）。反向同步**无法区分**「值是自己刚写的」还是「用户手动切的」⇒ 会把刚切过去的档**弹回**（症状：屏幕变一下又变回去，`probe sync` ③ 环永远不变）。修 = `FanState.update()` 打**自写窗口标记**（`_cc_mark_self_write`），`mode()` 在窗口内读到 == 自写目标值时不回滚；读到 ≠ 目标值才判定为外部切换。窗口默认 12s，`HIKSEMI_FAN_CC_SELF_WRITE_SEC` 可调（详见 §6.8） |
 
 ### 6.1 反序列化方式（为什么键是蛇形）
 
@@ -494,6 +495,73 @@ sudo ./fan-mode-map.py --scan             # 复查应全绿
 
 > ★ 名字认领的优先级：`hs 低速…` 前缀 → `低速|low|静音` 关键词 → 现有内容里的 profile。
 > 名字完全不相关时才回退到按内容认领。
+
+### 6.8 ★★ 「屏幕切档后自己弹回去」—— 反向同步的自我回滚
+
+**症状**：在小屏上把风扇从「标准」切到「低速」——
+
+1. 屏幕**确实变了一下**（显示了「低速」）；
+2. 1~3 秒后**又变回「标准」**；
+3. 此时跑 `probe-coolercontrol.sh sync`，第 ③ 环**永远显示 3**（标准），
+   看起来像"切档根本没生效"。
+
+**根因**：中间件有两条路径都在读写同一个 `modes.json`，形成**自我回滚闭环**：
+
+```
+屏幕切「低速」
+   └─▶ 中间件 set_hardware → fan.update(2)        ① 本地状态 = 2
+         └─▶ apply_to_external_app() → apply-mode.sh 2
+               └─▶ 写 modes.json: current_active_mode = 低速uid   ② CC 文件 = 低速
+   ┌─◀ 设备状态帧（每 2s 轮询）→ fan.mode()
+   │     └─▶ _cc_current_fan_mode() 读 modes.json → 得到 2
+   │           └─▶ ext(2) != cur(?) 时【覆盖本地状态】
+   └──────── 若本地此刻已是 2，看似无害；但在 apply 与读取交错、
+              或本地被别的路径写回旧值时，这一步就把 2 覆盖成旧值 ⇒ 弹回
+```
+
+★ 关键缺陷：反向同步**无法区分**「这个值是**我自己刚写进去的**」还是
+「用户在 CC Web UI 里手动切的」——两者读出来一模一样。只要判定成后者，
+就会拿 CC 的值**覆盖本地**，而 CC 的值又可能正是"上一轮"的残留 ⇒ 弹回。
+
+**修复（中间件 `FanState` 自写窗口）**：
+
+- `update(mode)` 在触发外部落地**之前**调用 `_cc_mark_self_write(mode)`，
+  记录「本进程刚把 CC 写成 `mode`」+ 一个时间窗口（默认 12s）。
+- `mode()` 反向同步时：
+  - 读到的 `ext == 自写目标` 且**在窗口内** ⇒ 判定为"自己刚写的"，**不回滚**；
+  - 读到的 `ext != 自写目标` ⇒ 判定为**用户在 CC UI 手动切换**，正常同步（屏幕跟上）。
+- 窗口秒数可用 `HIKSEMI_FAN_CC_SELF_WRITE_SEC` 覆盖（排障设 `0` 即关闭该机制）。
+
+★ 为什么用「时间窗 + 值比对」而不是「忽略接下来 N 次读取」：
+状态帧每 2s 一帧、客户端可能连点，读取次数**无法对齐**；而
+「窗口内读到 == 我刚下发的值」这个判据与次数无关，天然幂等。
+
+**判别（一条命令，实时抓现行）**：
+
+```bash
+sudo ./probe-coolercontrol.sh watch 30
+```
+
+然后在屏幕上切一次档，观察序列：
+
+```
+正常     : 3 → 2          （停在 2）
+自我回滚 : 3 → 2 → 3      （弹回去了 = 本 bug）
+```
+
+**修复步骤**：
+
+```bash
+# 1) 确认中间件是新版（probe ⑥ 环应全绿）
+sudo ./probe-coolercontrol.sh sync
+
+# 2) 若 ⑥ 环 NG → 同步新版中间件并重启
+sudo bash ../install-autostart.sh --fan-coolercontrol on
+sudo systemctl restart hiksemi-sub
+
+# 3) 再 watch 一次，切档应停在目标档
+sudo ./probe-coolercontrol.sh watch 30
+```
 
 ## 7. 为什么用「改文件 + 重启」而不是调 REST API
 

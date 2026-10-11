@@ -546,6 +546,111 @@ def main():
         mw._CC_REV_CACHE["sig"] = None
         _sh.rmtree(_ccdir, ignore_errors=True)
 
+    # ── 17. ★★ 自我回滚防护（屏幕切档 → 写 modes.json → 反向同步弹回）──────
+    #   真机 bug：屏幕切到「低速」后，中间件调 apply-mode.sh 把 modes.json 的
+    #   current_active_mode 写成「低速」；随后状态帧的 _cc_current_fan_mode()
+    #   读到这个「低速」，而本地状态也是「低速」→ 看似没问题……
+    #   ★ 但真正的坑是：如果本地状态被别的路径写回旧值（或 apply 与读取
+    #     交错），反向同步就会拿 CC 的值覆盖本地，表现为「切了一下又弹回去」。
+    #   防护 = update() 打自写窗口标记；窗口内读到 == 目标档位 ⇒ 不回滚。
+    print("\n【17】自我回滚防护（屏幕切档不被反向同步弹回）")
+    import json as _json2
+    import shutil as _sh2
+    _ccdir2 = tempfile.mkdtemp()
+    _modes_p2 = os.path.join(_ccdir2, "modes.json")
+    _map_p2 = os.path.join(_ccdir2, "hs-fan-mode-map.json")
+    _U_LOW2 = "aaaaaaaa-1111-2222-3333-444455556666"
+    _U_STD2 = "bbbbbbbb-1111-2222-3333-444455556666"
+    _modes2 = {"modes": [
+        {"uid": _U_STD2, "name": "hs 标准 55%", "all_device_settings": {}},
+        {"uid": _U_LOW2, "name": "hs 低速 25%", "all_device_settings": {}},
+    ], "current_active_mode": _U_STD2}
+
+    def _write_modes2(cur):
+        _modes2["current_active_mode"] = cur
+        with open(_modes_p2, "w", encoding="utf-8") as f:
+            _json2.dump(_modes2, f, ensure_ascii=False)
+        os.utime(_modes_p2, (time.time() + 3, time.time() + 3))
+
+    _saved_env2 = (os.environ.get("HIKSEMI_FAN_COOLERCONTROL"),
+                   os.environ.get(mw.CC_MODE_CONFIG_ENV),
+                   os.environ.get(mw.CC_FAN_MODE_MAP_ENV),
+                   os.environ.get(mw.CC_SELF_WRITE_ENV))
+    try:
+        os.environ["HIKSEMI_FAN_COOLERCONTROL"] = "1"
+        os.environ[mw.CC_MODE_CONFIG_ENV] = _modes_p2
+        os.environ[mw.CC_FAN_MODE_MAP_ENV] = _map_p2
+        mw._CC_REV_CACHE["sig"] = None
+        mw._CC_SELF_WRITE["mode"] = None
+        mw._CC_SELF_WRITE["until"] = 0.0
+
+        st9, p9 = make_state()
+        try:
+            # 初始：屏幕在「标准」，CC 也在标准
+            st9.update(3)
+            _write_modes2(_U_STD2)
+            mw._CC_REV_CACHE["sig"] = None
+            check("起始态：屏幕=3 与 CC=标准 一致", st9.mode() == 3, st9.mode())
+
+            # ★ 模拟「屏幕切到低速」：update(2) → 打自写标记 → 外部把
+            #   modes.json 写成低速（apply-mode.sh 的行为）
+            st9.update(2)
+            check("update(2) 后本地状态=2", st9.get()["fan_mode"] == 2,
+                  st9.get()["fan_mode"])
+            check("update(2) 已打自写标记",
+                  mw._CC_SELF_WRITE["mode"] == 2,
+                  mw._CC_SELF_WRITE["mode"])
+            check("自写窗口已开启", mw._cc_in_self_write_window())
+
+            _write_modes2(_U_LOW2)          # apply-mode.sh 写文件
+            mw._CC_REV_CACHE["sig"] = None
+            # ★ 关键断言：窗口内反向同步读到 2 == 自写目标 ⇒ 不得回滚
+            check("★ 自写窗口内：mode() 保持 2（不被弹回 3）",
+                  st9.mode() == 2, st9.mode())
+            check("★ 自写窗口内：本地状态仍为 2",
+                  st9.get()["fan_mode"] == 2, st9.get()["fan_mode"])
+
+            # ★ 对照：窗口过期后，用户真的在 CC UI 手动切了 → 必须同步
+            mw._CC_SELF_WRITE["until"] = 0.0        # 强制窗口过期
+            _write_modes2(_U_STD2)                  # 用户在 CC 切回标准
+            mw._CC_REV_CACHE["sig"] = None
+            check("窗口过期后：CC 手动切回标准 → 屏幕跟上 =3",
+                  st9.mode() == 3, st9.mode())
+
+            # ★ 边界：窗口开着但 CC 切到了【另一个】档 → 是真外部操作，要同步
+            st9.update(2)                           # 屏幕切低速（打标记）
+            check("再次切档：标记=2", mw._CC_SELF_WRITE["mode"] == 2,
+                  mw._CC_SELF_WRITE["mode"])
+            mw._CC_REV_CACHE["sig"] = None
+            _write_modes2(_U_STD2)                  # 但 CC 侧是标准（≠目标）
+            mw._CC_REV_CACHE["sig"] = None
+            check("窗口内但读到≠目标值 → 判定为外部切换，同步为 3",
+                  st9.mode() == 3, st9.mode())
+
+            # 窗口秒数可用环境变量覆盖
+            os.environ[mw.CC_SELF_WRITE_ENV] = "0"
+            check("窗口秒数可被 HIKSEMI_FAN_CC_SELF_WRITE_SEC 覆盖为 0",
+                  mw._cc_self_write_window() == 0.0, mw._cc_self_write_window())
+            os.environ.pop(mw.CC_SELF_WRITE_ENV, None)
+            check("不设环境变量时用默认 12s",
+                  mw._cc_self_write_window() == mw.CC_SELF_WRITE_WINDOW,
+                  mw._cc_self_write_window())
+        finally:
+            if os.path.exists(p9):
+                os.remove(p9)
+    finally:
+        for k, v in zip(("HIKSEMI_FAN_COOLERCONTROL",
+                         mw.CC_MODE_CONFIG_ENV, mw.CC_FAN_MODE_MAP_ENV,
+                         mw.CC_SELF_WRITE_ENV), _saved_env2):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        mw._CC_REV_CACHE["sig"] = None
+        mw._CC_SELF_WRITE["mode"] = None
+        mw._CC_SELF_WRITE["until"] = 0.0
+        _sh2.rmtree(_ccdir2, ignore_errors=True)
+
     # ── 16. 版本号 ──
     print("\n【16】版本号已递增")
     check("版本含 散热风扇/风扇", "风扇" in mw.MIDDLEWARE_VERSION, mw.MIDDLEWARE_VERSION)

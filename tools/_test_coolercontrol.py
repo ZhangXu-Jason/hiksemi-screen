@@ -523,15 +523,22 @@ fan4 = { disabled = true }
            p.returncode == 0 and "智能" in (p.stdout + p.stderr),
            (p.stdout + p.stderr)[-300:])
 
-    # 「屏幕 ↔ CC 不同步」四环诊断（sync 子命令）
+    # 「屏幕 ↔ CC 不同步」六环诊断（sync 子命令）
     ok("probe 支持 sync 子命令", '"sync"' in ptxt or "'sync'" in ptxt)
     ok("sync ① 先查工具是不是新版", "工具版本" in ptxt)
     ok("sync ② 查档位绑定", "档位 → Mode 绑定" in ptxt)
     ok("sync ③ 查反向档位", "反向档位" in ptxt)
     ok("sync ④ 查重启通道（改完要有人重启 daemon）", "重启通道" in ptxt)
     ok("sync ⑤ 查中间件是否已重启（新代码跑了没）", "中间件是否已重启" in ptxt)
+    ok("sync ⑥ 查自我回滚防护（屏幕切档弹回的根因）",
+       "自我回滚防护" in ptxt and "_cc_mark_self_write" in ptxt)
     ok("sync 提示重跑安装器即可同步（不再是 cp -rn 永不覆盖）",
        "内容比对同步" in ptxt or "cp -f" in ptxt)
+
+    # watch 子命令：实时抓「切了又弹回」
+    ok("probe 支持 watch 子命令（实时盯 modes.json）",
+       '"watch"' in ptxt or "'watch'" in ptxt)
+    ok("watch 说明「3 → 2 → 3 = 自我回滚」", "自我回滚" in ptxt and "3 → 2 → 3" in ptxt)
 
     # ── 13. --merge-modes（保留 UI 自建 Mode + 纠正「名字与内容不符」）──────
     sec("[13] --merge-modes（保留 UI 自建 Mode，纠正挂错的 profile）")
