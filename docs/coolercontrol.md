@@ -43,6 +43,10 @@ CoolerControl 的配置文件即可。
 | 标准 | `3` | `hs-standard` | `hs-standard`（两路共用） | Fixed **55%** |
 | 强劲 | `4` | `hs-high` | `hs-high`（两路共用） | Fixed **100%** |
 
+> ★★ **Mode uid 不是写死的**：在 Web UI 里自己建的 Mode，uid 是随机 UUID，
+> 档位靠 `hs-fan-mode-map.json` 绑定（可 `--bind`，也可按名字自动认领）。
+> 详见 **§6.5**（屏幕与 CoolerControl 不同步）。
+
 > ★ **每个 Mode 必须同时覆盖两个通道（fan3+fan2）**。`activate_mode()` 会把
 > Mode **未覆盖**的通道 Reset 掉，只写一路会导致另一路转速失控。`render-config.py`
 > 的 `validate_modes()` 会强制校验这一点。
@@ -100,8 +104,10 @@ CoolerControl daemon 启动
 | `config.toml` | **模板**：`[devices]` / `[device-settings]` / `[[profiles]]` / `[[functions]]` / `[settings]` | 是（`@DEVICE_UID@`、`@CPU_CHANNEL@`、`@CASE_CHANNEL@`、`@CPU_TEMP_*@`、`@CASE_TEMP_*@`、`@CPU_SMART_PROFILE@`、`@CASE_SMART_PROFILE@`） |
 | `modes.json` | **模板**：4 个 Mode 快照（均**双通道**）+ `order` + `current_active_mode` | 是 |
 | `render-config.py` | 渲染占位符 + 契约自校验（TOML/JSON）+ 原子写 + 自动备份；支持双风扇/单风扇/降级 | — |
-| `apply-mode.sh` | **中间件实际调用的入口**：`apply-mode.sh {5\|2\|3\|4}` | — |
-| `probe-coolercontrol.sh` | 只读探测真机：安装形态 / 端口 / 真实 uid / **双路 pwm 通道** / CPU 与机箱温度源；`modes` 子命令 = 诊断「Mode 在 UI 里空白」（见 §6.4） | — |
+| `apply-mode.sh` | **中间件实际调用的入口**：`apply-mode.sh {5\|2\|3\|4}`；另有 `--scan` / `--bind` / `--current` / `--status`（见 §6.5） | — |
+| `fan-mode-map.py` | ★ 档位 ↔ Mode 映射解析器：`--scan` / `--bind` / `--resolve` / `--reverse`（**自建 Mode 也不会失去同步**） | — |
+| `hs-fan-mode-map.json` | 渲染时生成的绑定文件（4 档 → `hs-*` uid），`--bind` 会改写它 | — |
+| `probe-coolercontrol.sh` | 只读探测真机：安装形态 / 端口 / 真实 uid / **真实通道名 fanN** / CPU 与机箱温度源；`modes` 子命令 = 诊断「Mode 在 UI 里空白」（见 §6.4） | — |
 
 > **为什么用「模板 + 渲染」而不是直接写死**：
 > `device_uid` 是 CoolerControl 依据设备 sysfs 属性算出的 **64 位 sha256**，
@@ -341,6 +347,67 @@ sudo /screen/tools/coolercontrol/probe-coolercontrol.sh modes   # 复查应全�
 
 > 换机器/设备名不同：`--fan-device-name` / `--cpu-temp-device-name` /
 > `--case-temp-device-name` 指定 `[devices]` 段里的显示名即可。
+
+### 6.5 ★★ 屏幕与 CoolerControl 不同步（新建模式后切档失效）
+
+**现象**：在 CoolerControl Web UI 里自己新建/改了 Mode 之后：
+
+- 小屏上切档 → CoolerControl 没反应（或报 "目标 Mode 不在 modes.json 中"）；
+- 在 UI 里手动切 Mode → 小屏仍显示旧档位。
+
+**根因**：旧实现把「档位 → Mode」的 uid 写死成
+`hs-smart / hs-low / hs-standard / hs-high`。而**在 Web UI 里自己建的 Mode，
+uid 是随机 UUID**（`1a700658-89d7-4d03-…`），不是 `hs-smart` ⇒ 屏幕发过来的
+档位找不到目标 Mode，链路断开。
+
+**现在的做法：绑定外置 + 自动认领**（`tools/coolercontrol/fan-mode-map.py`），
+解析优先级从高到低：
+
+| 优先级 | 规则 | 例子 |
+| --- | --- | --- |
+| ① | **显式绑定**（`hs-fan-mode-map.json`，值可以是 uid 或 Mode 名字） | `--bind 5=1a700658-…` |
+| ② | 默认 uid | `hs-smart` / `hs-low` / `hs-standard` / `hs-high` |
+| ③ | 名字前缀 | `"hs 智能…"` / `"hs 低速…"` / `"hs 标准…"` / `"hs 强劲…"` |
+| ④ | 名字含关键词 | `智能\|smart` / `低速\|low\|静音` / `标准\|standard` / `强劲\|high\|性能` |
+
+⇒ **在 UI 里随便建模式也行，名字里带档位关键词（智能/低速/标准/强劲）就能自动认领**；
+名字完全无关（比如"我的自定义模式"）时，绑定一次即可，不必重渲染、不必改 uid。
+
+```bash
+# ① 看清楚有哪些 Mode、每档当前绑定到谁（只读）
+sudo /screen/tools/coolercontrol/apply-mode.sh --scan
+
+# ② 绑定：用 uid 或 Mode 名字都行（可一次绑多个档位）
+sudo /screen/tools/coolercontrol/apply-mode.sh --bind 5=1a700658-89d7-4d03-8443-c9260d1604d9
+sudo /screen/tools/coolercontrol/apply-mode.sh --bind 2="hs 低速 25%" 4="性能模式"
+
+# ③ 解除绑定（回到自动认领）
+sudo /screen/tools/coolercontrol/apply-mode.sh --bind 2=
+```
+
+绑定结果写在 `hs-fan-mode-map.json`（默认与 `modes.json` 同目录，
+`render-config.py` 渲染时会一并生成，内容就是四个 `hs-*` uid）。
+
+**反向同步（CoolerControl → 小屏）**：中间件在生成状态帧时会读
+`modes.json` 的 `current_active_mode` 反查档位，在 UI 里手动切了模式，
+小屏回显会自动跟上（只在文件 mtime 变化时才解析，几乎无开销）。
+★ 这里**不会**反向写回 CoolerControl，否则两边互相改会形成死循环。
+
+```bash
+# 看当前激活的 Mode 对应屏幕哪一档
+sudo /screen/tools/coolercontrol/apply-mode.sh --current
+sudo /screen/tools/coolercontrol/apply-mode.sh --status
+```
+
+| 排查动作 | 命令 |
+| --- | --- |
+| 屏幕切了但 CC 没变 | `apply-mode.sh --scan` → 看该档位是不是"未匹配"；是就 `--bind` |
+| CC 切了但屏幕没变 | `apply-mode.sh --current` 能否识别；识别不出就是名字无关，需 `--bind` |
+| 切过去完全不生效 | `--scan` 里有没有 `@DEVICE_UID@` 非法键（模板占位符残留）⇒ 重新渲染 |
+| 都不行 | `probe-coolercontrol.sh modes`（UID/通道/profile 三方对比） |
+
+> ★ 每次切档都要**重启 daemon**（`systemctl restart coolercontrold`），
+> 这是 6.x 之前的既定路径（Mode 是启动时读 `current_active_mode` 激活的）。
 
 ## 7. 为什么用「改文件 + 重启」而不是调 REST API
 

@@ -18,6 +18,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import middleware as mw
@@ -459,8 +460,94 @@ def main():
           mw.FAN_STATE_CANDIDATES[0])
     check("兜底在脚本同目录", mw.FAN_STATE_CANDIDATES[1].endswith(".fan-state.json"))
 
-    # ── 15. 版本号 ──
-    print("\n【15】版本号已递增")
+    # ── 15. ★ CoolerControl 反向同步（CC → 小屏）─────────────────────────
+    #   用户在 Web UI 里自己建了 Mode（uid 是随机 UUID，不是 hs-smart），
+    #   然后在 UI 里手动切档 —— 小屏回显必须跟上，否则就是「不同步」。
+    print("\n【15】CoolerControl 反向同步（CC → 小屏）")
+    import json as _json
+    import shutil as _sh
+    _ccdir = tempfile.mkdtemp()
+    _modes_p = os.path.join(_ccdir, "modes.json")
+    _map_p = os.path.join(_ccdir, "hs-fan-mode-map.json")
+    U_SMART = "1a700658-89d7-4d03-8443-c9260d1604d9"
+    U_LOW = "57070995-90a9-41cc-b0dd-d88c7f4aac34"
+    U_MINE = "deadbeef-0000-1111-2222-333344445555"
+    _modes = {"modes": [
+        {"uid": U_SMART, "name": "hs 智能（CPU 曲线 + 机箱曲线）", "all_device_settings": {}},
+        {"uid": U_LOW, "name": "hs 低速 25%", "all_device_settings": {}},
+        {"uid": U_MINE, "name": "我的自定义模式", "all_device_settings": {}},
+    ], "current_active_mode": U_LOW}
+
+    def _write_modes(cur):
+        _modes["current_active_mode"] = cur
+        with open(_modes_p, "w", encoding="utf-8") as f:
+            _json.dump(_modes, f, ensure_ascii=False)
+        os.utime(_modes_p, (time.time() + 1, time.time() + 1))
+
+    _saved_env = (os.environ.get("HIKSEMI_FAN_COOLERCONTROL"),
+                  os.environ.get(mw.CC_MODE_CONFIG_ENV),
+                  os.environ.get(mw.CC_FAN_MODE_MAP_ENV))
+    try:
+        os.environ["HIKSEMI_FAN_COOLERCONTROL"] = "1"
+        os.environ[mw.CC_MODE_CONFIG_ENV] = _modes_p
+        os.environ[mw.CC_FAN_MODE_MAP_ENV] = _map_p
+        mw._CC_REV_CACHE["sig"] = None
+
+        _write_modes(U_LOW)
+        mw._CC_REV_CACHE["sig"] = None
+        check("UUID Mode（名字「hs 低速…」）反查出档位 2",
+              mw._cc_current_fan_mode() == 2, mw._cc_current_fan_mode())
+
+        _write_modes(U_SMART)
+        mw._CC_REV_CACHE["sig"] = None
+        check("切到「hs 智能…」反查出档位 5",
+              mw._cc_current_fan_mode() == 5, mw._cc_current_fan_mode())
+
+        _write_modes(U_MINE)
+        mw._CC_REV_CACHE["sig"] = None
+        check("名字无关（我的自定义模式）→ None（不乱猜，保持本地）",
+              mw._cc_current_fan_mode() is None, mw._cc_current_fan_mode())
+
+        # ── 显式绑定后即可识别（等价于 apply-mode.sh --bind 2=<uid>）──
+        with open(_map_p, "w", encoding="utf-8") as f:
+            _json.dump({"2": U_MINE}, f)
+        os.utime(_map_p, (time.time() + 2, time.time() + 2))
+        mw._CC_REV_CACHE["sig"] = None
+        check("--bind 后自定义 Mode 反查出档位 2",
+              mw._cc_current_fan_mode() == 2, mw._cc_current_fan_mode())
+
+        # ── FanState.mode() 会把 CC 侧的值同步回本地（屏幕回显跟着变）──
+        _write_modes(U_LOW)
+        mw._CC_REV_CACHE["sig"] = None
+        st8, p8 = make_state()
+        st8.update(5)                       # 屏幕当前在「智能」
+        _write_modes(U_LOW)                 # 用户在 CC UI 里手动切到「低速」
+        mw._CC_REV_CACHE["sig"] = None
+        try:
+            check("mode() 反向同步：本地 5 → CC 的 2", st8.mode() == 2, st8.mode())
+            check("同步后已持久化（重开仍是 2）",
+                  mw.FanState(path=p8).mode(sync_external=False) == 2)
+        finally:
+            if os.path.exists(p8):
+                os.remove(p8)
+
+        # 关掉开关 → 不再读 CC（避免没装 CoolerControl 时空转）
+        os.environ["HIKSEMI_FAN_COOLERCONTROL"] = "0"
+        mw._CC_REV_CACHE["sig"] = None
+        check("未启用 CoolerControl 时不做反向同步",
+              mw._cc_current_fan_mode() is None)
+    finally:
+        for k, v in zip(("HIKSEMI_FAN_COOLERCONTROL",
+                         mw.CC_MODE_CONFIG_ENV, mw.CC_FAN_MODE_MAP_ENV), _saved_env):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        mw._CC_REV_CACHE["sig"] = None
+        _sh.rmtree(_ccdir, ignore_errors=True)
+
+    # ── 16. 版本号 ──
+    print("\n【16】版本号已递增")
     check("版本含 散热风扇/风扇", "风扇" in mw.MIDDLEWARE_VERSION, mw.MIDDLEWARE_VERSION)
 
     if os.path.exists(p):

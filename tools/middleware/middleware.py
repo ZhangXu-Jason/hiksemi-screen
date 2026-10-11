@@ -1599,6 +1599,7 @@ FAN_MODES = {
     4: "强劲",
 }
 FAN_MODE_VALID = tuple(FAN_MODES.keys())          # (5, 2, 3, 4)
+FAN_MODE_ORDER = FAN_MODE_VALID                  # 解析 Mode 名字时的优先级顺序
 FAN_MODE_DEFAULT = 5                              # 默认「智能」
 
 # 状态文件（首选标准状态目录，兜底脚本同目录）
@@ -1617,6 +1618,27 @@ FAN_APPLY_CMD_ENV = "HIKSEMI_FAN_APPLY_CMD"
 FAN_COOLERCONTROL_ENV = "HIKSEMI_FAN_COOLERCONTROL"
 # 可覆盖 apply-mode.sh 的路径（默认自动定位）
 FAN_COOLERCONTROL_SCRIPT_ENV = "HIKSEMI_FAN_COOLERCONTROL_SCRIPT"
+
+# ── ★ CoolerControl【反向同步】：CoolerControl → 小屏 ──────────────────────
+#   用户在 CoolerControl Web UI 里手动激活了别的 Mode 时，小屏回显必须跟上，
+#   否则就出现「屏幕显示智能、实际跑的是强劲」的不同步。
+#   路径可用环境变量覆盖（与 tools/coolercontrol/fan-mode-map.py 完全一致）：
+#     CC_MODE_CONFIG   modes.json
+#     CC_FAN_MODE_MAP  档位映射文件（默认与 modes.json 同目录）
+CC_MODE_CONFIG_ENV = "CC_MODE_CONFIG"
+CC_FAN_MODE_MAP_ENV = "CC_FAN_MODE_MAP"
+CC_MODES_DEFAULT = "/etc/coolercontrol/modes.json"
+CC_MAP_FILENAME = "hs-fan-mode-map.json"
+# 渲染器产出的默认 uid（★ 必须与 fan-mode-map.py 的 DEFAULT_UIDS 一致）
+CC_DEFAULT_MODE_UIDS = {5: "hs-smart", 2: "hs-low",
+                        3: "hs-standard", 4: "hs-high"}
+# 名字关键词兜底（用户自建 Mode 时的自动认领规则）
+CC_MODE_NAME_KEYS = {
+    5: ("hs 智能", "智能", "smart", "auto", "自动"),
+    2: ("hs 低速", "低速", "low", "静音", "quiet", "silent"),
+    3: ("hs 标准", "标准", "standard", "normal", "medium", "常规"),
+    4: ("hs 强劲", "强劲", "high", "full", "性能", "max", "turbo"),
+}
 #   也可直接指定 sysfs PWM 节点（兜底）：写入按档位换算后的 PWM 值
 FAN_ATTR_PWM_ENV = "HIKSEMI_FAN_PWM_PATH"
 
@@ -1710,8 +1732,27 @@ class FanState:
                 pass
             return dict(self._data)
 
-    def mode(self):
-        """便捷读：直接返回 fan_mode 整数"""
+    def mode(self, sync_external=True):
+        """便捷读：直接返回 fan_mode 整数。
+
+        ★ 若启用了 CoolerControl，会先做【反向同步】（CoolerControl → 小屏）：
+          用户在 Web UI 里手动激活了别的 Mode 时，小屏回显必须跟上，
+          否则会出现「屏幕显示智能、实际跑的是强劲」的不同步。
+          ★ 这里【绝不】触发 apply_to_external_app()，否则会写回 modes.json
+            并重启 daemon，形成"屏幕←→CC"互相改的死循环。
+        """
+        if sync_external:
+            ext = _cc_current_fan_mode()
+            if ext is not None:
+                with self._lock:
+                    cur = int(self._data.get("fan_mode", FAN_MODE_DEFAULT))
+                    if ext != cur:
+                        self._data["fan_mode"] = ext
+                        self._save_locked()
+                        log(f"[fan] 检测到 CoolerControl 侧手动切换："
+                            f"{cur}（{FAN_MODES.get(cur, '?')}）→ "
+                            f"{ext}（{FAN_MODES.get(ext, '?')}），小屏回显已同步",
+                            level="quiet")
         return int(self.get().get("fan_mode", FAN_MODE_DEFAULT))
 
     def update(self, fan_mode):
@@ -1745,6 +1786,92 @@ def _coolercontrol_enabled():
     """HIKSEMI_FAN_COOLERCONTROL 是否开启（1/true/yes/on 均可）。"""
     v = os.environ.get(FAN_COOLERCONTROL_ENV, "").strip().lower()
     return v in ("1", "true", "yes", "on")
+
+
+# mtime 缓存：状态帧每秒都会调，只在文件真变了才重新解析
+_CC_REV_CACHE = {"sig": None, "mode": None}
+
+
+def _cc_paths():
+    mp = os.environ.get(CC_MODE_CONFIG_ENV, "").strip() or CC_MODES_DEFAULT
+    mf = os.environ.get(CC_FAN_MODE_MAP_ENV, "").strip() or \
+        os.path.join(os.path.dirname(mp) or "/etc/coolercontrol", CC_MAP_FILENAME)
+    return mp, mf
+
+
+def _cc_norm(s):
+    return re.sub(r"\s+", "", str(s or "")).lower()
+
+
+def _cc_current_fan_mode():
+    """★ 读 CoolerControl 当前激活的 Mode，反查成屏幕档位（5/2/3/4）。
+
+    返回 None = 识别不出（Mode 名字不含档位关键词且没做 --bind）→ 保持本地状态。
+    解析优先级：映射文件 → 默认 uid → 名字关键词（与 fan-mode-map.py 一致）。
+    """
+    if not _coolercontrol_enabled():
+        return None
+    modes_p, map_p = _cc_paths()
+    try:
+        sig = (os.path.getmtime(modes_p) if os.path.exists(modes_p) else 0,
+               os.path.getmtime(map_p) if os.path.exists(map_p) else 0)
+    except Exception:
+        return None
+    if _CC_REV_CACHE["sig"] == sig:
+        return _CC_REV_CACHE["mode"]
+
+    mode = None
+    try:
+        with open(modes_p, encoding="utf-8") as f:
+            d = json.load(f)
+        cur = d.get("current_active_mode")
+        by_uid = {m.get("uid"): m for m in (d.get("modes") or [])
+                  if isinstance(m, dict)}
+
+        # ① 映射文件（--bind 写入的显式绑定）
+        mapping = {}
+        if os.path.exists(map_p):
+            try:
+                with open(map_p, encoding="utf-8") as f:
+                    mm = json.load(f)
+                if isinstance(mm, dict):
+                    for k, v in mm.items():
+                        try:
+                            mapping[int(k)] = str(v).strip()
+                        except (TypeError, ValueError):
+                            continue
+            except Exception:
+                pass
+        for k, v in mapping.items():
+            if v == cur:
+                mode = k
+                break
+
+        # ② 默认 uid
+        if mode is None:
+            for k, u in CC_DEFAULT_MODE_UIDS.items():
+                if u == cur:
+                    mode = k
+                    break
+
+        # ③ 名字认领（前缀 → 关键词）
+        if mode is None:
+            name = _cc_norm((by_uid.get(cur) or {}).get("name"))
+            for m_ in FAN_MODE_ORDER:
+                for key in CC_MODE_NAME_KEYS.get(m_, ()):
+                    k = _cc_norm(key)
+                    if k and (name.startswith(k) or k in name):
+                        mode = m_
+                        break
+                if mode is not None:
+                    break
+    except Exception as e:
+        log(f"[fan] ⚠ 读 CoolerControl 当前 Mode 失败: {e}", level="debug")
+        mode = None
+
+    _CC_REV_CACHE["sig"] = sig
+    _CC_REV_CACHE["mode"] = mode
+    return mode
 
 
 def apply_to_external_app(prev_mode, state):

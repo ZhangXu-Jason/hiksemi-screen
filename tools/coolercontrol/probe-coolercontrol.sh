@@ -181,6 +181,11 @@ if not empty and not bad_uid and not bad_prof and not bad_chan:
     print("    ① daemon 读的是不是这个目录（docker 挂载路径 / XDG 路径）")
     print("    ② 改完要重启 daemon：sudo systemctl restart coolercontrold")
     print("    ③ UI 硬刷新（Ctrl+F5），前端会缓存设备表")
+    print()
+    print("  ★ 若问题是『屏幕切档 / CC 切模式不同步』（而不是 UI 空白），")
+    print("    那是【档位 ↔ Mode 绑定】问题，跑这个：")
+    print("      sudo ./apply-mode.sh --scan        # 看每档绑定到谁")
+    print("      sudo ./apply-mode.sh --bind 5=<uid 或 Mode 名字>")
 PY
     echo
     exit 0

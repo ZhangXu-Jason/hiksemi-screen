@@ -26,6 +26,10 @@
 | 标准 | `3` | `hs-standard` | Fixed 55% |
 | 强劲 | `4` | `hs-high` | Fixed 100% |
 
+> ★★ **Mode uid 不是写死的**：在 Web UI 里自己新建的 Mode，uid 是随机 UUID，
+> 档位靠 `hs-fan-mode-map.json` 绑定（显式 `--bind`，或按 Mode **名字**自动认领）。
+> 详见下面「★ 档位 ↔ Mode 绑定」。
+
 > 探测不到温度源时自动降级：CPU 侧 → `hs-smart-fallback`（Fixed 35%）、
 > 机箱侧 → `hs-case-fallback`（Fixed 40%）；由 `render-config.py` 自动处理。
 > 单风扇机器用 `--single-channel`。
@@ -43,7 +47,8 @@ apply_to_external_app()
    │  HIKSEMI_FAN_APPLY_CMD="/screen/tools/coolercontrol/apply-mode.sh {mode}"
    ▼
 apply-mode.sh 4
-   │  ① modes.json: current_active_mode = "hs-high"（原子写）
+   │  ① 解析档位 → Mode uid（fan-mode-map.py：绑定 > 默认 uid > 名字）
+   │  ② modes.json: current_active_mode = <解析出的 uid>（原子写）
    │  ② 重启 coolercontrold（systemd 或 docker）
    ▼
 CoolerControl daemon 启动 → activate_mode("hs-high")
@@ -60,8 +65,32 @@ CoolerControl daemon 启动 → activate_mode("hs-high")
 | `modes.json` | **模板**。4 个 Mode 快照（均双通道），含占位符 |
 | `render-config.py` | 占位符渲染 + TOML/JSON 契约自校验 + 原子写 + 备份；支持双风扇/单风扇/降级 |
 | `apply-mode.sh` | **中间件调用的落地脚本**。`apply-mode.sh {5\|2\|3\|4}` |
-| `probe-coolercontrol.sh` | 只读探测真机：安装形态、端口、真实 device_uid / **双路 pwm 通道** / CPU 与机箱温度源 |
+| `fan-mode-map.py` | ★ 档位 ↔ Mode 映射解析：`--scan` / `--bind` / `--resolve` / `--reverse` |
+| `hs-fan-mode-map.json` | 渲染时一并生成的绑定文件（4 档 → `hs-*` uid）；`--bind` 改写它 |
+| `probe-coolercontrol.sh` | 只读探测真机：安装形态、端口、真实 device_uid / **真实通道名 fanN** / CPU 与机箱温度源 |
 | `README.md` | 本文档 |
+
+## ★ 档位 ↔ Mode 绑定（自建 Mode 也不会失去同步）
+
+在 Web UI 里**自己新建**的 Mode，uid 是随机 UUID（`1a700658-…`），不是 `hs-smart`。
+若档位写死 uid，屏幕切档就找不到目标 Mode ⇒「屏幕和 CoolerControl 不同步」。
+
+解析优先级（`fan-mode-map.py`）：
+
+1. **显式绑定** `hs-fan-mode-map.json`（值可以是 uid，也可以是 Mode 名字）
+2. 默认 uid：`hs-smart` / `hs-low` / `hs-standard` / `hs-high`
+3. 名字前缀：`"hs 智能…"` / `"hs 低速…"` / `"hs 标准…"` / `"hs 强劲…"`
+4. 名字含关键词：`智能|smart` / `低速|low|静音` / `标准|standard` / `强劲|high|性能`
+
+```bash
+sudo ./apply-mode.sh --scan                     # 有哪些 Mode？每档绑定到谁？
+sudo ./apply-mode.sh --bind 5=<uid 或 Mode 名>  # 绑定（名字无关的模式必须绑）
+sudo ./apply-mode.sh --bind 2=                  # 解除，回到自动认领
+sudo ./apply-mode.sh --current                  # 当前激活的 Mode 对应哪一档
+```
+
+**反向同步**：中间件读 `modes.json` 的 `current_active_mode` 反查档位，
+在 UI 里手动切了模式，小屏回显会自动跟上（不会反向写回，避免死循环）。
 
 ## 快速开始
 

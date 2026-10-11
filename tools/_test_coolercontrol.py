@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -381,6 +382,146 @@ fan4 = { disabled = true }
     ok("诊断能报「不是真机已知通道」", "不是真机已知通道" in ptxt)
     ok("诊断提示 --auto（而非只提示 --auto-uid）", "--auto --config-dir" in ptxt)
     ok("探测脚本说明通道名是 fanN 而非 pwmN", "不是 sysfs 里的 pwmN" in ptxt)
+
+    # ── 12. 档位 ↔ Mode 绑定解耦（用户在 UI 新建模式后仍要能同步）────────
+    #   背景：用户在 CoolerControl Web UI 里自己建的 Mode，uid 是随机 UUID，
+    #   不是 hs-smart —— 写死 uid 会让屏幕切档直接失败（「屏幕与 CC 不同步」）。
+    sec("[12] fan-mode-map.py：档位绑定不再写死 uid")
+    MAP = os.path.join(CC_DIR, "fan-mode-map.py")
+    APPLY = os.path.join(CC_DIR, "apply-mode.sh")
+    ok("fan-mode-map.py 存在", os.path.isfile(MAP))
+
+    ui_dir = os.path.join(TMPROOT, "uibuilt")
+    os.makedirs(ui_dir, exist_ok=True)
+    U_SMART = "1a700658-89d7-4d03-8443-c9260d1604d9"
+    U_LOW = "57070995-90a9-41cc-b0dd-d88c7f4aac34"
+    U_STD = "c89036e4-e6db-4c96-98a8-f8702288959b"
+    U_HIGH = "52c9453f-9659-4d5b-b9f8-d768f1e028c7"
+    U_MINE = "11111111-2222-3333-4444-555555555555"
+    DEV = "71b063a3608e1f4f066afff5ba8ad37f92375b73d6005164d9e16752347f8742"
+    modes_ui = {
+        "order": [U_SMART, U_LOW, U_STD, U_HIGH, U_MINE],
+        "current_active_mode": U_SMART,
+        "modes": [
+            {"uid": U_SMART, "name": "hs 智能（CPU 曲线 + 机箱曲线）",
+             "all_device_settings": {DEV: {"fan3": {"channel_name": "fan3",
+                                                    "profile_uid": "hs-cpu-graph"}}}},
+            {"uid": U_LOW, "name": "hs 低速 25%",
+             "all_device_settings": {DEV: {"fan3": {"channel_name": "fan3",
+                                                    "profile_uid": "hs-low"}}}},
+            {"uid": U_STD, "name": "hs 标准 55%",
+             "all_device_settings": {DEV: {"fan3": {"channel_name": "fan3",
+                                                    "profile_uid": "hs-standard"}}}},
+            {"uid": U_HIGH, "name": "hs 强劲 100%",
+             "all_device_settings": {DEV: {"fan3": {"channel_name": "fan3",
+                                                    "profile_uid": "hs-high"}}}},
+            # 名字与档位完全无关的自定义模式：自动认领不了，只能 --bind
+            {"uid": U_MINE, "name": "我的自定义模式",
+             "all_device_settings": {DEV: {"fan3": {"channel_name": "fan3",
+                                                    "profile_uid": "hs-low"}}}},
+        ],
+    }
+    ui_modes_p = os.path.join(ui_dir, "modes.json")
+    ui_map_p = os.path.join(ui_dir, "hs-fan-mode-map.json")
+
+    def write_modes(cur=None):
+        if cur:
+            modes_ui["current_active_mode"] = cur
+        with open(ui_modes_p, "w", encoding="utf-8") as f:
+            json.dump(modes_ui, f, ensure_ascii=False)
+        os.utime(ui_modes_p, (time.time() + 1, time.time() + 1))
+
+    def run_map(args):
+        env = dict(os.environ, CC_MODE_CONFIG=ui_modes_p, CC_FAN_MODE_MAP=ui_map_p)
+        p = subprocess.run([sys.executable, MAP, *args],
+                           capture_output=True, text=True, env=env)
+        return p.returncode, (p.stdout + p.stderr).strip()
+
+    write_modes()
+    rc, out = run_map(["--resolve", "5"])
+    ok("UUID Mode（名字 hs 智能…）解析出档位 5",
+       rc == 0 and out.endswith(U_SMART), out)
+    for m_, want in ((2, U_LOW), (3, U_STD), (4, U_HIGH)):
+        rc, out = run_map(["--resolve", str(m_)])
+        ok(f"档位 {m_} 解析到用户在 UI 建的 UUID Mode", rc == 0 and out.endswith(want),
+           out)
+
+    rc, out = run_map(["--reverse"])
+    ok("反向：当前激活 UUID → 档位 5", rc == 0 and out.endswith("5"), out)
+
+    write_modes(U_LOW)
+    rc, out = run_map(["--reverse"])
+    ok("反向：切到「hs 低速」→ 档位 2", rc == 0 and out.endswith("2"), out)
+
+    # 名字完全无关 → 识别不出（不瞎猜），--bind 之后即可用
+    write_modes(U_MINE)
+    rc, out = run_map(["--reverse"])
+    ok("自定义模式识别不出（不乱猜，返回非 0）", rc != 0, out)
+    rc, out = run_map(["--bind", f"2={U_MINE}"])
+    ok("--bind 写入映射", rc == 0 and os.path.isfile(ui_map_p), out)
+    ok("映射文件内容正确",
+       json.load(open(ui_map_p, encoding="utf-8")).get("2") == U_MINE)
+    rc, out = run_map(["--resolve", "2"])
+    ok("★ 绑定优先：档位 2 现在指向自定义模式", rc == 0 and out.endswith(U_MINE), out)
+    rc, out = run_map(["--reverse"])
+    ok("★ 绑定后反向也能识别 → 2", rc == 0 and out.endswith("2"), out)
+    # 绑完再解绑，验证 --bind 空值可解除
+    rc, out = run_map(["--bind", "2="])
+    rc, out = run_map(["--resolve", "2"])
+    ok("解绑后回落到名字匹配（hs 低速）", rc == 0 and out.endswith(U_LOW), out)
+
+    rc, out = run_map(["--scan"])
+    ok("--scan 能跑通且列出全部档位绑定", rc == 0 and "智能" in out, out[-400:])
+
+    # 占位符残留（@DEVICE_UID@）必须被 --scan 抓出来
+    raw_dir = os.path.join(TMPROOT, "rawmode")
+    os.makedirs(raw_dir, exist_ok=True)
+    raw = {"modes": [{"uid": U_SMART, "name": "hs 智能",
+                      "all_device_settings": {"@DEVICE_UID@": {}}}],
+           "current_active_mode": U_SMART}
+    with open(os.path.join(raw_dir, "modes.json"), "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False)
+    env_raw = dict(os.environ,
+                   CC_MODE_CONFIG=os.path.join(raw_dir, "modes.json"),
+                   CC_FAN_MODE_MAP=os.path.join(raw_dir, "hs-fan-mode-map.json"))
+    p = subprocess.run([sys.executable, MAP, "--scan"],
+                       capture_output=True, text=True, env=env_raw)
+    ok("--scan 能抓出未渲染的占位符键（@DEVICE_UID@）",
+       p.returncode != 0 and "@DEVICE_UID@" in (p.stdout + p.stderr),
+       (p.stdout + p.stderr)[-300:])
+
+    # apply-mode.sh 接线
+    atxt = open(APPLY, encoding="utf-8", errors="replace").read()
+    ok("apply-mode.sh 支持 --scan", "--scan" in atxt)
+    ok("apply-mode.sh 支持 --bind", "--bind" in atxt)
+    ok("apply-mode.sh 支持 --current（反向）", "--current" in atxt)
+    ok("apply-mode.sh 解析交给 fan-mode-map.py", "fan-mode-map.py" in atxt)
+    ok("apply-mode.sh 导出 CC_MODE_CONFIG 给子脚本",
+       "export CC_MODE_CONFIG" in atxt)
+    ok("apply-mode.sh 不再只认 hs-* uid（有名字回退提示）",
+       "--bind {fan_mode}" in atxt)
+    ok("切换失败时提示用 --scan/--bind 绑定", "--scan" in atxt and "--bind" in atxt)
+
+    # 渲染产物必须自带映射文件（否则屏幕切档只能靠名字蒙）
+    d5 = os.path.join(TMPROOT, "withmap")
+    rc, out = run_render(["--host", "hs-afs-r1"], d5)
+    map_out = os.path.join(d5, "hs-fan-mode-map.json")
+    ok("渲染同时写出档位映射文件", rc == 0 and os.path.isfile(map_out), out[-300:])
+    ok("映射默认指向 hs-* 四个 Mode",
+       os.path.isfile(map_out) and
+       json.load(open(map_out, encoding="utf-8")) ==
+       {"5": "hs-smart", "2": "hs-low", "3": "hs-standard", "4": "hs-high"})
+
+    # 真跑一次 --scan（有 bash 时）
+    bash = shutil.which("bash")
+    if bash:
+        env2 = dict(os.environ, CC_MODE_CONFIG=ui_modes_p,
+                    CC_FAN_MODE_MAP=ui_map_p)
+        p = subprocess.run([bash, APPLY, "--scan"], capture_output=True,
+                           text=True, env=env2)
+        ok("bash apply-mode.sh --scan 可执行且输出档位绑定",
+           p.returncode == 0 and "智能" in (p.stdout + p.stderr),
+           (p.stdout + p.stderr)[-300:])
 
 finally:
     shutil.rmtree(TMPROOT, ignore_errors=True)

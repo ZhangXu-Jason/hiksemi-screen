@@ -121,6 +121,13 @@ HOST_PRESETS = {
 # 保留 uid（daemon 会自动补写，这里只用于校验提示）
 BASE_PROFILES = ("0", "hs-low", "hs-standard", "hs-high")
 
+# ── 档位 ↔ Mode 绑定（★ 必须与同目录 fan-mode-map.py 完全一致）───────────────
+#   5=智能 / 2=低速 / 3=标准 / 4=强劲（与小彩屏 UI 的 fan_mode 一致）
+FAN_MODE_ORDER = (5, 2, 3, 4)
+DEFAULT_UIDS = {5: "hs-smart", 2: "hs-low", 3: "hs-standard", 4: "hs-high"}
+# 映射文件随渲染产物一起写出；屏幕切档与「CC→屏幕」反向同步都读它
+MAP_FILENAME = "hs-fan-mode-map.json"
+
 
 def die(msg):
     print(f"[render] ERROR: {msg}", file=sys.stderr)
@@ -743,7 +750,7 @@ def main():
     modes_raw = substitute(modes_raw, mapping)
     modes_text, modes_obj = strip_json_comments(modes_raw)
     if not dual:
-        # 单风扇：从每个 Mode 移除 pwm2 通道
+        # 单风扇：从每个 Mode 移除机箱通道
         for m in modes_obj["modes"]:
             for dev in m["all_device_settings"].values():
                 dev.pop(case_ch, None)
@@ -755,9 +762,17 @@ def main():
         return 0
 
     os.makedirs(out_dir, exist_ok=True)
+    # ── ★ 档位 ↔ Mode 映射文件 ──────────────────────────────────────────
+    #   屏幕切档时靠它定位要激活哪个 Mode（apply-mode.sh / 中间件反向同步共用）。
+    #   默认指向渲染器产出的 hs-* uid；用户若改用自己在 Web UI 建的模式，
+    #   跑 `apply-mode.sh --bind 5=<uid 或 Mode 名字>` 改这里即可，不必重渲染。
+    fan_map_text = json.dumps(
+        {str(m_): DEFAULT_UIDS[m_] for m_ in FAN_MODE_ORDER},
+        ensure_ascii=False, indent=2) + "\n"
     targets = {
         os.path.join(out_dir, "config.toml"): cfg_text,
         os.path.join(out_dir, "modes.json"): modes_text,
+        os.path.join(out_dir, MAP_FILENAME): fan_map_text,
     }
     for path, text in targets.items():
         if os.path.exists(path):
