@@ -11,22 +11,25 @@
 # 或从 CoolerControl Web UI（http://<NAS>:11987 → System → 设备信息）复制。
 #
 # ── ★ 本机是【双风扇】───────────────────────────────────────────────────────
-#   本机 it8613 超级 I/O 暴露两路可控 PWM，各自跟随不同温度源：
+#   ★★ 通道名务必用【CoolerControl 的通道名】，hwmon 设备一律是 fanN，
+#      ★ 不是 sysfs 里的 pwmN！写错通道名 = UI 里 Mode 的「通道/设置」全空白。
+#      （真机 it8613 暴露 fan1..fan5，fan4/fan5 已在 UI 禁用，实际用 fan2/fan3）
 #
 #     通道     风扇       温度源                          对应 profile
 #     ------   --------   -----------------------------   ----------------
-#     pwm1     CPU 风扇   CPU 核心（Intel Core i3-N305）   hs-cpu-graph
-#     pwm2     机箱 风扇  核显 i915（机箱热源，转码时升温） hs-case-graph
+#     fan3     CPU 风扇   CPU 核心（Intel Core i3-N305）   hs-cpu-graph
+#     fan2     机箱 风扇  核显 i915（机箱热源，转码时升温） hs-case-graph
 #
 #   ⇒ 两个通道【各自独立】按自己的曲线调速，互不影响。
+#   ⇒ 换机器/换接线：用 probe-coolercontrol.sh 或 --auto-channels 取真值。
 #
 # ── 与界面的对应关系 ────────────────────────────────────────────────────────
 #   界面档位    fan_mode   CoolerControl Mode   落地形态
 #   ---------   --------   ------------------   ------------------------------
-#   智能            5      hs-smart             pwm1→CPU 曲线 + pwm2→机箱曲线
-#   低速            2      hs-low               pwm1/pwm2 均 Fixed 25%
-#   标准            3      hs-standard          pwm1/pwm2 均 Fixed 55%
-#   强劲            4      hs-high              pwm1/pwm2 均 Fixed 100%
+#   智能            5      hs-smart             CPU 通道→CPU 曲线 + 机箱通道→机箱曲线
+#   低速            2      hs-low               两路均 Fixed 25%
+#   标准            3      hs-standard          两路均 Fixed 55%
+#   强劲            4      hs-high              两路均 Fixed 100%
 #
 #   中间件通过 apply-mode.sh 切换 Mode（改 modes.json 的 current_active_mode
 #   并重启 daemon），本文件里的 [device-settings] 只作为「开机默认/兜底」。
@@ -38,9 +41,11 @@
 # ★ 下面是本机（HS-AFS-R1，i3-N305）实测 device_uid → 设备名 的映射，可直接使用。
 #   若换机器，用 probe-coolercontrol.sh 重新探测后替换本段。
 #   关键设备（风扇四档落地只用到前三个）：
-#     71b063a3… = "it8613"                    ← 风扇 PWM 控制器（ITE 超级 I/O，双路 pwm1/pwm2）
-#     336d28e0… = "Intel(R) Core(TM) i3-N305" ← CPU 核心温度（pwm1/CPU 风扇曲线温度源）
-#     58cea05e… = "i915"                      ← 核显温度（pwm2/机箱风扇曲线温度源）
+#     71b063a3… = "it8613"                    ← 风扇 PWM 控制器（ITE 超级 I/O）
+#     336d28e0… = "Intel(R) Core(TM) i3-N305" ← CPU 核心温度（CPU 风扇曲线温度源）
+#     58cea05e… = "i915"                      ← 核显温度（机箱风扇曲线温度源）
+#   ★ temp_name 一律填【传感器名】（hwmon 的 temp1_input ⇒ "temp1"），
+#     ★ 不是上面的设备显示名 —— 填设备名会导致温度源匹配不上。
 71b063a3608e1f4f066afff5ba8ad37f92375b73d6005164d9e16752347f8742 = "it8613"
 f42333b13a2853dfb8e516c576470622e74a4659bfffe7ca229f68733beae979 = "acpitz"
 336d28e0c7580fdf9135eb62a4626ff7c3cbfdfef20a61d19fc92198f26bc7bd = "Intel(R) Core(TM) i3-N305"
@@ -65,14 +70,14 @@ d0c7c5c6d23b32eecf58d67ee9721f7992d8c4f117723becd5d750b6dbffb590 = "ST10000NM001
 [legacy690]
 # ── ★ 设备通道默认设置（开机由 apply_on_boot 应用）─────────────────────────
 # ★ 关键契约：键 = 设备 UID；值必须是【内联表】（channel = { ... }），
-#   不能写成 [device-settings.xxx.pwm1] 子表，否则 daemon 读不到。
+#   不能写成 [device-settings.xxx.fan3] 子表，否则 daemon 读不到。
 # ★ 双通道写在【同一个内联表】里，用逗号分隔：
-#      "pwm1" = { profile_uid = "..." }, "pwm2" = { profile_uid = "..." }
+#      "fan3" = { profile_uid = "..." }, "fan2" = { profile_uid = "..." }
 #   ⚠ 不能写成两个独立的 [device-settings.xxx] 段 —— TOML 会报重复表。
 # ★ speed_fixed 与 profile_uid 互斥：设置其一会自动清空另一个。
 #   优先级：SpeedFixed → Profile → Lighting → Lcd
 [device-settings."@DEVICE_UID@"]
-# 开机默认 = 智能档：pwm1 走 CPU 曲线，pwm2 走机箱(i915)曲线
+# 开机默认 = 智能档：CPU 通道走 CPU 曲线，机箱通道走机箱(i915)曲线
 "@CPU_CHANNEL@"  = { profile_uid = "@CPU_SMART_PROFILE@" }
 "@CASE_CHANNEL@" = { profile_uid = "@CASE_SMART_PROFILE@" }
 
@@ -113,13 +118,13 @@ p_type = "Fixed"
 function_uid = "0"
 speed_fixed = 100
 
-# ---- ★ 智能档 pwm1 · CPU 温度曲线（fan_mode=5）----------------------------
+# ---- ★ 智能档 · CPU 风扇通道温度曲线（fan_mode=5）--------------------------
 # Graph profile：speed_profile = [[温度℃, 占空比%], ...]
 #   temp_source 必须是【内联表】{ temp_name, device_uid }
 #   temp_min / temp_max 必须是【浮点】（写成 30.0 而非 30）
 #   曲线点温度必须【单调递增】，占空比 0–100 整数，且首点温度必须 == temp_min
 #
-# ★ 曲线设计说明（CPU 风扇，源 = i3-N305 核心温度）：
+# ★ 曲线设计说明（CPU 风扇，源 = i3-N305 的 temp1）：
 #   i3-N305 是 15W TDP 的 Alder Lake-N，满载也就在 80℃ 上下；
 #   采用「低载静音 / 高载拉满」的两段式：
 #     ≤45℃  22%   日常待机 / 轻载，风扇低速近乎无声
@@ -145,7 +150,7 @@ speed_profile = [
     [88.0, 100],   # ≥88℃ 100%   兜底
 ]
 
-# ---- ★ 智能档 pwm2 · 机箱温度曲线（fan_mode=5）----------------------------
+# ---- ★ 智能档 · 机箱风扇通道温度曲线（fan_mode=5）--------------------------
 # ★ 温度源 = 核显 i915（用户指定的「机箱温度调节」曲线）。
 #   本机没有独立的机箱温度传感器；机箱内的主要热源是核显转码，
 #   因此用 i915 温度作为机箱风扇的代理温度源（与实际热负荷正相关）。
@@ -185,7 +190,7 @@ p_type = "Fixed"
 function_uid = "0"
 speed_fixed = 35
 
-# ---- 智能档兜底（仅缺机箱温度源、CPU 曲线仍可用时，pwm2 用此）-------------
+# ---- 智能档兜底（仅缺机箱温度源、CPU 曲线仍可用时，机箱通道用此）-------------
 [[profiles]]
 uid = "hs-case-fallback"
 name = "hs 机箱 · 兜底 40%"
@@ -216,7 +221,7 @@ bypass_min_at_extremes = false
 #   作用：给曲线叠加「迟滞 + 步进限速」，避免温度在阈值附近抖动时转速来回跳。
 #   duty_minimum = 5：唯一用途是满足 daemon 的字段合法性下限；
 #     由于 bypass_min_at_extremes = true，温度低于曲线最左点时【不做抬底】，
-#     所以 pwm2（机箱曲线首点 = 0%）仍能真正停转。
+#     所以机箱通道（曲线首点 = 0%）仍能真正停转。
 #   step_size_max_increasing/decreasing：单次调整幅度上限（%），
 #     response_delay = 2.0 s 表示每 2 秒最多走一次 ⇒ 转速变化平滑。
 [[functions]]

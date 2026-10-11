@@ -102,6 +102,13 @@ for u, chans in ds.items():
     info(f"device-settings {u[:12]}… → {chans or '（空）'}"
          + ("  ✓" if u in devices else "  ✗ 该 UID 不在 [devices] 中（已漂移！）"))
 
+# ★ 真机【已知可用通道】= daemon 写进 [device-settings] 的通道（唯一权威）
+known_chans = set()
+for u, chans in ds.items():
+    if u in devices:
+        known_chans.update(chans)
+bad_chan = set()
+
 sec("3. modes.json 引用的设备 / 通道 / profile")
 if not os.path.isfile(mod_p):
     ng(f"无 {mod_p}")
@@ -123,37 +130,53 @@ for m in mj.get("modes", []):
                 extra = "  ← 不像 64 位 hex：modes.json 未渲染（还留着占位符）？"
             print(f"  {m['uid']:<12} 设备 {str(u)[:12]}…  \033[31m✗ 不在 [devices] 中\033[0m{extra}")
         else:
-            ch_list = ", ".join(f"{c}→{v.get('profile_uid') or v.get('speed_fixed')}"
-                                for c, v in chans.items())
-            print(f"  {m['uid']:<12} {name[:24]:<24} {ch_list}")
+            parts = []
+            for c, v in chans.items():
+                mark = ""
+                if known_chans and c not in known_chans:
+                    bad_chan.add(c)
+                    mark = " \033[31m✗ 不是真机已知通道\033[0m"
+                parts.append(f"{c}→{v.get('profile_uid') or v.get('speed_fixed')}{mark}")
+            print(f"  {m['uid']:<12} {name[:24]:<24} " + ", ".join(parts))
         for c, v in chans.items():
             p = v.get("profile_uid")
             if p and p not in profiles:
                 bad_prof.add(f"{m['uid']}:{p}")
 info(f"current_active_mode = {mj.get('current_active_mode')}")
+info(f"真机已知通道（[device-settings]）: "
+     + (", ".join(sorted(known_chans)) if known_chans else "（无）"))
 
 sec("4. 结论")
 if empty:
     ng(f"这些 Mode 的 all_device_settings 是空的（UI 必空白）: {', '.join(empty)}")
     print("    → modes.json 未渲染（还带着 @DEVICE_UID@ 占位符）或被 daemon 覆盖；")
-    print("      重新渲染：sudo ./render-config.py --host hs-afs-r1 --auto-uid")
+    print(f"      重新渲染：sudo ./render-config.py --host hs-afs-r1 --auto --config-dir {cc}")
 if bad_uid:
     if any(not re.fullmatch(r"[0-9a-f]{64}", str(u)) for u in bad_uid):
         ng("modes.json 里的设备 UID 不是合法 64 位 hex ⇒ 这份文件【没有渲染过】")
         print("    → 模板直接拷过去用了。渲染：")
-        print(f"      sudo ./render-config.py --host hs-afs-r1 --auto-uid --config-dir {cc}")
+        print(f"      sudo ./render-config.py --host hs-afs-r1 --auto --config-dir {cc}")
     else:
         ng(f"{len(bad_uid)} 个设备 UID 与 daemon 真值对不上 ⇒ UI 里 Mode 内容必然空白")
-        print("    ★ 这就是「看不到设备/通道/设置」的根因：UID 漂移，不是模板结构问题")
-        print("    修复（按设备名重新对齐 UID，一条命令）：")
-        print(f"      sudo ./render-config.py --host hs-afs-r1 --auto-uid --config-dir {cc}")
+        print("    ★ 这就是「看不到设备/通道/设置」的根因之一：UID 漂移")
+        print("    修复（按设备名重新对齐 UID）：")
+        print(f"      sudo ./render-config.py --host hs-afs-r1 --auto --config-dir {cc}")
 elif not empty:
     ok("modes.json 引用的设备 UID 全部命中 daemon 真值")
+if bad_chan:
+    ng(f"引用了真机上不存在的通道: {', '.join(sorted(bad_chan))}")
+    print("    ★★ 这是「看不到设备/通道/设置」最常见的真因：")
+    print("       CoolerControl 的通道名是 fanN（hwmon 设备），★ 不是 sysfs 里的 pwmN。")
+    print(f"       真机已知通道: {', '.join(sorted(known_chans)) or '（无）'}")
+    print("    修复（自动采用真机通道名）：")
+    print(f"      sudo ./render-config.py --host hs-afs-r1 --auto --config-dir {cc}")
+elif known_chans and not empty:
+    ok("引用的通道名都在真机已知通道内")
 if bad_prof:
     ng(f"引用了不存在的 profile: {', '.join(sorted(bad_prof))}")
 elif not empty:
     ok("所有 profile_uid 都在 config.toml 的 profiles 中")
-if not empty and not bad_uid and not bad_prof:
+if not empty and not bad_uid and not bad_prof and not bad_chan:
     print("  → 内容层面无问题。若 UI 仍空白，检查：")
     print("    ① daemon 读的是不是这个目录（docker 挂载路径 / XDG 路径）")
     print("    ② 改完要重启 daemon：sudo systemctl restart coolercontrold")
@@ -274,8 +297,12 @@ elif command -v docker >/dev/null 2>&1; then
     done
 fi
 
-# ── 5. 内核侧 hwmon：真实存在哪些 pwm 通道 ──────────────────────────────────
-SEC "5. 内核 hwmon 风扇通道（channel 名的来源）"
+# ── 5. 内核侧 hwmon：真实存在哪些风扇通道 ────────────────────────────────────
+# ★★ 关键：CoolerControl 的【通道名】是 fanN，不是 sysfs 的 pwmN。
+#    写错通道名与 UID 漂移症状一样 —— UI 里 Mode 的「设备/通道/设置」全空白。
+#    唯一权威来源是 config.toml 的 [device-settings] 段（daemon 只写它认识的通道），
+#    本节的 sysfs 列表只用来交叉验证。
+SEC "5. 内核 hwmon 风扇通道（sysfs 视角：pwmN / fanN_input）"
 FOUND_ANY=0
 for h in /sys/class/hwmon/hwmon*; do
     [ -d "$h" ] || continue
@@ -289,24 +316,39 @@ for h in /sys/class/hwmon/hwmon*; do
 done
 [ "$FOUND_ANY" = "0" ] && NG "未发现任何 pwm*/fan*_input（风扇可能由 EC 管理，不走 hwmon）"
 
-# ★ 双风扇：把该设备下所有 pwmN 都列出来，前两路分别当 CPU / 机箱候选。
-#   本机 it8613 实测有 pwm1(CPU) + pwm2(机箱)，故取前两路。
+# ★ 双风扇候选：取该设备下所有 pwmN（对应 CoolerControl 的 fanN）。
+#   本机 it8613 实测 fan1..fan5，仅 fan2/fan3 实接风扇（fan4/fan5 在 UI 里已禁用）。
+#   ⇒ 具体用哪两路以 config.toml 的 [device-settings] 为准（见 §3 / §5.1）。
 for h in /sys/class/hwmon/hwmon*; do
     [ -d "$h" ] || continue
     [ "$(cat "$h/name" 2>/dev/null)" = "it8613" ] || continue
     PWMS="$(ls "$h" 2>/dev/null | grep -E '^pwm[0-9]+$' | sort)"
     N="$(printf '%s\n' "$PWMS" | grep -c .)"
     if [ "$N" -ge 2 ]; then
+        LAST="$(printf '%s\n' "$PWMS" | tail -1)"
         CHANNEL="$(printf '%s\n' "$PWMS" | sed -n 1p)"
-        CASE_CHANNEL="$(printf '%s\n' "$PWMS" | sed -n 2p)"
-        OK "检测到 $N 路 PWM → 双风扇：cpu_channel=$CHANNEL  case_channel=$CASE_CHANNEL"
-        INFO "★ 前两路默认按「pwm1=CPU、pwm2=机箱」分配；若接线相反，"
-        INFO "  用 --cpu-channel/--case-channel 交换即可（渲染前先确认哪个风扇对应哪路）。"
+        CASE_CHANNEL="$LAST"
+        OK "检测到 $N 路 PWM → 候选通道 fan1…fan$N（CoolerControl 通道名）"
+        INFO "★ 默认取首尾两路：cpu_channel=${CHANNEL/pwm/fan}  case_channel=${CASE_CHANNEL/pwm/fan}"
+        INFO "  ⚠ 这只是候选！真正的通道名以 §5.1「daemon 实际写入的通道」为准。"
     elif [ "$N" -eq 1 ]; then
         CHANNEL="$(printf '%s\n' "$PWMS" | sed -n 1p)"
         INFO "只检测到 1 路 PWM（$CHANNEL）→ 单风扇，渲染时加 --single-channel"
     fi
 done
+
+# ── 5.1 ★ daemon 实际写入的通道名（权威）───────────────────────────────────
+SEC "5.1 daemon 实际写入的通道名（[device-settings]，★ 权威来源）"
+if [ -n "$CC_CONF_DIR" ] && [ -f "$CC_CONF_DIR/config.toml" ]; then
+    awk '/^\[device-settings/{f=1;print "    "$0;next} /^\[/{f=0} f&&NF{print "      "$0}' \
+        "$CC_CONF_DIR/config.toml"
+    awk '/^\[settings\.[0-9a-f]+\.channel_settings\]/{f=1;print "    "$0;next} /^\[/{f=0} f&&NF{print "      "$0}' \
+        "$CC_CONF_DIR/config.toml"
+    INFO "⇒ 渲染时用 --auto-channels（或 --auto）即可自动采用这里的通道名，"
+    INFO "  并按通道当前挂的 profile 名推断角色（…cpu…→CPU 风扇、…case…→机箱风扇）。"
+else
+    NG "无 config.toml，无法给出权威通道名（先让 daemon 成功启动一次）"
+fi
 
 # ── 6. CPU 温度传感器候选 ────────────────────────────────────────────────────
 SEC "6. CPU 温度传感器候选（智能档曲线 temp_source）"
@@ -331,35 +373,28 @@ done
 # ── 7. 汇总：可直接复制的渲染命令 ────────────────────────────────────────────
 SEC "7. 汇总"
 echo "  device_uid        : ${DEVICE_UID:-<请在 Web UI → System 中查看，或读 config.toml>}"
-echo "  cpu_channel       : ${CHANNEL:-<通常为 pwm1，见第 5 节>}"
-echo "  case_channel      : ${CASE_CHANNEL:-<双风扇时通常为 pwm2；单风扇留空>}"
-echo "  cpu_temp_name     : ${CPU_TEMP_NAME:-<见第 6 节>}"
+echo "  cpu_channel       : ${CHANNEL:-<见 §5.1（daemon 实际写入的通道名）>}"
+echo "  case_channel      : ${CASE_CHANNEL:-<双风扇时第二路；单风扇留空>}"
+echo "  cpu_temp_name     : temp1   ← ★ CoolerControl 的 temp_name 是【传感器名】，"
+echo "                               对应 hwmon 的 temp1_input，不是设备显示名"
 echo "  cpu_temp_dev_uid  : ${CPU_TEMP_DEVICE_UID:-<Web UI 中该传感器所在设备 UID>}"
-echo "  case_temp_name    : ${CASE_TEMP_NAME:-<机箱/GPU 温度源，可选；缺省则 pwm2 走兜底>}"
+echo "  case_temp_name    : ${CASE_TEMP_NAME:-temp1（机箱/GPU 温度源；缺省则走兜底）}"
 echo "  case_temp_dev_uid : ${CASE_TEMP_DEVICE_UID:-<同上>}"
+echo
+echo "  ★ 最省事：sudo ./render-config.py --host hs-afs-r1 --auto --config-dir $CC_CONF_DIR"
+echo "    （--auto = --auto-uid + --auto-channels，UID 与通道名全部按真机真值对齐）"
 
-if [ "$SHORT" = "1" ] && [ -n "$DEVICE_UID" ]; then
+if [ "$SHORT" = "1" ]; then
     echo
-    if [ -n "$CHANNEL" ] && [ -n "$CASE_CHANNEL" ]; then
-        # 双风扇
-        echo "sudo ./render-config.py --device-uid $DEVICE_UID \\"
-        echo "     --cpu-channel $CHANNEL --case-channel $CASE_CHANNEL \\"
-        echo "     --cpu-temp-name \"${CPU_TEMP_NAME:-Package id 0}\" \\"
-        echo "     --cpu-temp-device-uid <CPU_TEMP_DEVICE_UID> \\"
-        echo "     --case-temp-name \"${CASE_TEMP_NAME:-temp1}\" \\"
-        echo "     --case-temp-device-uid <CASE_TEMP_DEVICE_UID> \\"
-        echo "     --out-dir $CC_CONF_DIR"
-    else
-        # 单风扇（或未探测到通道）
-        echo "sudo ./render-config.py --device-uid $DEVICE_UID --cpu-channel ${CHANNEL:-pwm1} \\"
-        echo "     --single-channel \\"
-        echo "     --cpu-temp-name \"${CPU_TEMP_NAME:-Package id 0}\" \\"
-        echo "     --cpu-temp-device-uid <CPU_TEMP_DEVICE_UID> --out-dir $CC_CONF_DIR"
-    fi
+    # ★ 不再手工拼 --cpu-channel：sysfs 的 pwmN ≠ CoolerControl 的通道名 fanN，
+    #   手抄极易写错（写错 = UI 里 Mode 内容空白）。统一交给 --auto 去真机取。
+    echo "sudo ./render-config.py --host hs-afs-r1 --auto \\"
+    echo "     --config-dir ${CC_CONF_DIR:-/etc/coolercontrol}"
+    echo "#  --auto = --auto-uid + --auto-channels：UID 与通道名全部按真机真值对齐"
 fi
 
 echo
 echo "提示：最省事的方式是先在 CoolerControl Web UI（https://<NAS>:11987）里"
 echo "      随便给风扇设一次转速，让 daemon 把 [device-settings] 段写出来，"
-echo "      本脚本第 3 节即可直接读出真实 device_uid 与 channel。"
+echo "      本脚本 §3 / §5.1 即可直接读出真实 device_uid 与【通道名】(fanN)。"
 exit 0

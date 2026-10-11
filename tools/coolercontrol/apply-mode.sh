@@ -12,7 +12,7 @@
 #     apply-mode.sh --dry-run 3       # 只打印将要做的动作，不落盘
 #
 # 档位映射（与界面一致）：
-#     5 智能 → hs-smart      （pwm1=CPU 曲线, pwm2=机箱曲线）
+#     5 智能 → hs-smart      （CPU 通道=CPU 曲线, 机箱通道=机箱曲线）
 #     2 低速 → hs-low        （Fixed 25%，两路）
 #     3 标准 → hs-standard   （Fixed 55%，两路）
 #     4 强劲 → hs-high       （Fixed 100%，两路）
@@ -69,9 +69,9 @@ mode_name_for() {
 
 cmd_list() {
     cat <<'EOF'
-界面档位   fan_mode   CoolerControl Mode   Fixed/曲线（双路 pwm1=CPU / pwm2=机箱）
+界面档位   fan_mode   CoolerControl Mode   Fixed/曲线（双路 fan3=CPU / fan2=机箱）
 --------   --------   ------------------   --------------------------------------
-智能            5      hs-smart             pwm1→CPU 曲线 + pwm2→机箱曲线
+智能            5      hs-smart             CPU 通道→CPU 曲线 + 机箱通道→机箱曲线
 低速            2      hs-low               Fixed 25%（两路）
 标准            3      hs-standard          Fixed 55%（两路）
 强劲            4      hs-high              Fixed 100%（两路）
@@ -152,26 +152,42 @@ if ! have_root; then
 fi
 
 # 原子更新 modes.json：current_active_mode / previous_active_mode
+# ★ python 负责：把新 JSON 写进 $TMP，并把【最终采用的 mode uid】打印到 stdout。
+#   为什么要把 uid 回传：真机上 Mode 可能是用户在 Web UI 里手工建的，
+#   uid 是随机 UUID（1a700658-…）而不是我们的 hs-smart；此时按【名字前缀】
+#   回退匹配，否则界面切档会直接失败「目标 Mode 不在 modes.json 中」。
 TMP="$(mktemp)"
-if ! python3 - "$MODE_CONFIG" "$MODE_UID" > "$TMP" <<'PY'
+NEW_UID="$(python3 - "$MODE_CONFIG" "$TMP" "$MODE_UID" <<'PY'
 import json, sys
-path, target = sys.argv[1], sys.argv[2]
+path, tmp, target = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(path, encoding="utf-8") as f:
     d = json.load(f)
-uids = [m.get("uid") for m in d.get("modes", [])]
+modes = d.get("modes", [])
+uids = [m.get("uid") for m in modes]
 if target not in uids:
-    print(f"目标 Mode {target!r} 不在 modes.json 中（可选: {uids}）", file=sys.stderr)
-    sys.exit(1)
+    # ★ 名字回退：hs-smart → "hs 智能…"（UI 里手工建的 Mode 名通常照抄这个前缀）
+    prefix = {"hs-smart": "hs 智能", "hs-low": "hs 低速",
+              "hs-standard": "hs 标准", "hs-high": "hs 强劲"}.get(target)
+    alt = next((m.get("uid") for m in modes
+                if prefix and (m.get("name") or "").startswith(prefix)), None)
+    if not alt:
+        print(f"目标 Mode {target!r} 不在 modes.json 中（可选: {uids}）",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"[fan-apply] 注意: 未找到 uid={target}，按名字匹配到 {alt}",
+          file=sys.stderr)
+    target = alt
 cur = d.get("current_active_mode")
 if cur != target:
     d["previous_active_mode"] = cur
     d["current_active_mode"] = target
-print(json.dumps(d, ensure_ascii=False, indent=2))
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(json.dumps(d, ensure_ascii=False, indent=2))
+print(target)
 PY
-then
-    rm -f "$TMP"
-    die "更新 modes.json 失败"
-fi
+)" || { rm -f "$TMP"; die "更新 modes.json 失败"; }
+[ -n "$NEW_UID" ] || { rm -f "$TMP"; die "更新 modes.json 失败（未拿到 mode uid）"; }
+[ "$NEW_UID" = "$MODE_UID" ] || MODE_UID="$NEW_UID"
 
 # 原样写回（保留缩进 2）
 if [ "$DRY_RUN" = "1" ]; then

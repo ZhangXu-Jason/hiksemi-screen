@@ -11,8 +11,13 @@
 
 | 通道 | 风扇 | 温度源 | 智能档 Profile |
 | --- | --- | --- | --- |
-| `pwm1` | CPU 风扇 | CPU 核心（i3-N305） | `hs-cpu-graph` |
-| `pwm2` | 机箱风扇 | 核显 i915 | `hs-case-graph` |
+| `fan3` | CPU 风扇 | CPU 核心（i3-N305，传感器名 `temp1`） | `hs-cpu-graph` |
+| `fan2` | 机箱风扇 | 核显 i915（传感器名 `temp1`） | `hs-case-graph` |
+
+> ★★ **通道名是 `fanN`，不是 sysfs 里的 `pwmN`！** CoolerControl 对 hwmon 设备
+> 一律用 `fan1…fanN` 作通道名（真机 it8613 暴露 fan1..fan5，fan4/fan5 已禁用）。
+> 写错通道名 = UI 里 Mode 的「设备/通道/设置」一片空白（与 UID 漂移症状相同）。
+> 用 `--auto-channels`（或 `--auto`）自动取真机真值，别手抄。
 
 | 界面档位 | `fan_mode` | CoolerControl Mode | 落地形态（两路） |
 |---|---|---|---|
@@ -76,7 +81,13 @@ sudo /screen/tools/coolercontrol/probe-coolercontrol.sh
 sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 \
       --out-dir /etc/coolercontrol
 #    列出内置机型：render-config.py --list-hosts
-#    ⇒ 默认 = 双风扇：pwm1→CPU 曲线、pwm2→机箱(i915)曲线
+#    ⇒ 默认 = 双风扇：fan3→CPU 曲线、fan2→机箱(i915)曲线
+#
+#    ★ 更推荐（不手抄任何真机参数）：
+# sudo render-config.py --host hs-afs-r1 --auto --config-dir /etc/coolercontrol
+#      --auto = --auto-uid + --auto-channels（UID 与通道名都按真机真值对齐）
+#      --fixed-pct 30,60,100      保留手调过的三档转速（默认 25,55,100）
+#      --fallback-pct 30,35       保留手调过的兜底转速（默认 35,40）
 
 # 渲染开关：
 #   --single-channel    单风扇机器（只渲染一路）
@@ -86,8 +97,8 @@ sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 \
 # 等价手工写法（其它机型参照）：
 # sudo /screen/tools/coolercontrol/render-config.py \
 #       --device-uid <64位hex> \
-#       --cpu-channel pwm1 --case-channel pwm2 \
-#       --cpu-temp-name "Intel(R) Core(TM) i3-N305" \
+#       --cpu-channel fan3 --case-channel fan2 \
+#       --cpu-temp-name "temp1" \   # ★ 传感器名，不是设备显示名
 #       --cpu-temp-device-uid <64位hex> \
 #       --case-temp-name "temp1" \
 #       --case-temp-device-uid <64位hex> \
@@ -128,9 +139,9 @@ sudo grep -i 'fan' /var/log/hiksemi-sub/kiosk.log
 ## 契约要点（源码级已确认，踩坑记录）
 
 - `[device-settings.<uid>]` 的通道值**必须是内联表** `{ ... }`，
-  写成 `[device-settings.uid.pwm1]` 子表 daemon 读不到。
+  写成 `[device-settings.uid.fan3]` 子表 daemon 读不到。
 - **双通道写在同一个内联表**里，用逗号分隔：
-  `"pwm1" = { ... }, "pwm2" = { ... }`。
+  `"fan3" = { ... }, "fan2" = { ... }`。
   ⚠ 不能写成两个独立的 `[device-settings.<uid>]` 段 —— TOML 会报重复表。
 - `speed_fixed` 与 `profile_uid` **互斥**，设置其一会清空另一个。
 - `temp_source` 是**内联表** `{ temp_name, device_uid }`；
@@ -158,11 +169,11 @@ sudo grep -i 'fan' /var/log/hiksemi-sub/kiosk.log
 
 - **重启代价**：切换档位会重启 daemon（< 2s），风扇会短暂回到开机默认后
   立刻应用新档。若不能接受，可改用 CoolerControl REST API（需处理 token）。
-- **多风扇（本机默认双风扇）**：本机 it8613 有 `pwm1`(CPU) + `pwm2`(机箱)，
+- **多风扇（本机默认双风扇）**：本机 it8613 的可控通道是 `fan3`(CPU) + `fan2`(机箱)，
   两条曲线各管一路。渲染时用 `--cpu-channel` / `--case-channel` 指定；
   **每个 Mode 必须覆盖全部通道**，否则未覆盖的会被 Reset（渲染器会强制校验）。
-  只有一路 PWM 的机器加 `--single-channel`，否则会多写一路不存在的 pwm2。
-- **接线方向**：无法从 sysfs 判断哪个风扇接了哪路，默认按「pwm1=CPU、pwm2=机箱」
+  只有一路风扇的机器加 `--single-channel`，否则会多写一路不存在的通道。
+- **接线方向**：无法从 sysfs 判断哪个风扇接了哪路，默认按「fan3=CPU、fan2=机箱」
   推断。若实际相反，跑渲染时交换 `--cpu-channel` / `--case-channel` 即可
   （两条曲线的温度源与阈值是分开的，交换通道号不影响曲线本身）。
 - **降级链路**：未安装 CoolerControl 时，`apply-mode.sh` 会告警并以

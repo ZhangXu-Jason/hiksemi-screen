@@ -11,6 +11,9 @@ render-config.py —— 把 CoolerControl 模板渲染成真机上可直接使�
   # 2) 渲染（写入 CoolerControl 配置目录）—— 推荐用机型预设
   sudo ./render-config.py --host hs-afs-r1 --out-dir /etc/coolercontrol
 
+  # 2b) ★ 更推荐：按真机真值自动对齐（device UID + 通道名）后再渲染
+  sudo ./render-config.py --host hs-afs-r1 --auto --config-dir /etc/coolercontrol
+
   # 3) 手工指定（换机器时）
   sudo ./render-config.py \
         --device-uid 6a1f...c9 \
@@ -47,9 +50,14 @@ render-config.py —— 把 CoolerControl 模板渲染成真机上可直接使�
    传错 uid 会导致配置被 daemon 忽略（不报错、也不生效）。
 
 ★ 双风扇说明
-   本机 it8613 暴露 pwm1 / pwm2 两路，各自跟随独立温度源：
-     pwm1 → CPU 核心温度 → 走 hs-cpu-graph
-     pwm2 → 核显 i915 温度 → 走 hs-case-graph
+   本机 it8613 暴露两路可控风扇，各自跟随独立温度源：
+     通道 fan3 → CPU 核心温度 → 走 hs-cpu-graph
+     通道 fan2 → 核显 i915 温度 → 走 hs-case-graph
+   ★★ 通道名是 CoolerControl 的通道名：hwmon 设备一律 fanN，
+      ★ 不是 sysfs 里的 pwmN —— 写错通道名与 UID 漂移症状完全一样
+      （UI 里 Mode 的「设备/通道/设置」一片空白），务必用
+      --auto-channels 或 probe-coolercontrol.sh 取真值。
+   ★ temp_name 填【传感器名】（hwmon 的 temp1_input ⇒ "temp1"），不是设备显示名。
    both 通道都会写进 [device-settings] 与每个 Mode，避免 activate_mode 时被 Reset。
 
 ★ device UID 会漂移（重要）
@@ -85,9 +93,16 @@ UID_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 HOST_PRESETS = {
     "hs-afs-r1": {
         "device_uid": "71b063a3608e1f4f066afff5ba8ad37f92375b73d6005164d9e16752347f8742",
-        "cpu_channel": "pwm1",
-        "case_channel": "pwm2",
-        "cpu_temp_name": "Intel(R) Core(TM) i3-N305",
+        # ★★ 通道名是【CoolerControl 的通道名】，hwmon 设备一律是 fanN，
+        #    ★ 不是 sysfs 里的 pwmN！真机 it8613 暴露 fan1..fan5，其中：
+        #      fan3 = CPU 风扇、fan2 = 机箱风扇（fan4/fan5 已在 UI 里 disabled）。
+        #    教训：曾按 sysfs 的 pwm1/pwm2 写死 ⇒ UI 里 Mode「通道/设置」全空白
+        #    （通道名 join 不上，与 UID 漂移症状一模一样，极易误判）。
+        "cpu_channel": "fan3",
+        "case_channel": "fan2",
+        # ★ temp_name 是【传感器名】（hwmon 的 temp1_input → "temp1"），
+        #   ★ 不是设备显示名！曾误写成 "Intel(R) Core(TM) i3-N305" ⇒ 温度源对不上。
+        "cpu_temp_name": "temp1",
         "cpu_temp_device_uid":
             "336d28e0c7580fdf9135eb62a4626ff7c3cbfdfef20a61d19fc92198f26bc7bd",
         "case_temp_name": "temp1",
@@ -98,8 +113,8 @@ HOST_PRESETS = {
         "fan_device_name": "it8613",
         "cpu_temp_device_name": "Intel(R) Core(TM) i3-N305",
         "case_temp_device_name": "i915",
-        "note": "海康 HS-AFS-R1（Intel i3-N305）：双风扇 = it8613 pwm1(CPU)/pwm2(机箱)；"
-                "温度源 = CPU 核心 + 核显 i915",
+        "note": "海康 HS-AFS-R1（Intel i3-N305）：双风扇 = it8613 fan3(CPU)/fan2(机箱)；"
+                "温度源 = CPU 核心 + 核显 i915（传感器名都是 temp1）",
     },
 }
 
@@ -193,6 +208,59 @@ def find_device_uid(devmap, want_name, label):
     return None, f"{label}: [devices] 中找不到设备名 {want_name!r}"
 
 
+def parse_device_settings(text):
+    """从 config.toml 解析 [device-settings.*] 段 → {uid: {channel: profile_uid|None}}。
+
+    ★ 这是【通道名的唯一权威来源】：daemon 只会把它认识的通道写进来。
+      （sysfs 里叫 pwmN，CoolerControl 的通道名却是 fanN —— 不能靠 ls 猜）
+    """
+    out = {}
+    for sm in re.finditer(
+            r'^\[device-settings\.[ \t]*"?([^"\]]+)"?\][ \t]*$(.*?)(?=^[ \t]*\[)',
+            text, flags=re.M | re.S):
+        uid = sm.group(1)
+        if "@" in uid:          # 未渲染的占位符残留，跳过
+            continue
+        chans = {}
+        for cm in re.finditer(r'^"?([^"\s=]+)"?[ \t]*=[ \t]*\{([^}]*)\}',
+                              sm.group(2), flags=re.M):
+            pm = re.search(r'profile_uid[ \t]*=[ \t]*"([^"]*)"', cm.group(2))
+            chans[cm.group(1)] = pm.group(1) if pm else None
+        out[uid] = chans
+    return out
+
+
+def parse_disabled_channels(text, dev_uid):
+    """解析 [settings.<uid>.channel_settings] 里被 disabled 的通道。"""
+    off = set()
+    pat = (r'^\[\s*settings\.[ \t]*"?%s"?\.channel_settings\s*\][ \t]*$(.*?)(?=^[ \t]*\[)'
+           % re.escape(dev_uid))
+    m = re.search(pat, text, flags=re.M | re.S)
+    if not m:
+        return off
+    for cm in re.finditer(r'^"?([^"\s=]+)"?[ \t]*=[ \t]*\{([^}]*)\}', m.group(1), flags=re.M):
+        if re.search(r'disabled[ \t]*=[ \t]*true', cm.group(2)):
+            off.add(cm.group(1))
+    return off
+
+
+def set_profile_fixed(text, uid, val):
+    """把指定 profile 的 speed_fixed 改成 val。
+
+    ★ 用途：用户在 Web UI 里手调过转速（如低速 25→30、标准 55→60），
+      重新渲染时应能带上这些偏好，否则一渲染就被打回模板默认值。
+    """
+    blocks = text.split("[[profiles]]")
+    for i, b in enumerate(blocks[1:], 1):
+        if re.search(r'^uid[ \t]*=[ \t]*"%s"' % re.escape(uid), b, flags=re.M):
+            nb, n = re.subn(r'(speed_fixed[ \t]*=[ \t]*)(\d+)',
+                            lambda m: m.group(1) + str(val), b, count=1)
+            if n:
+                blocks[i] = nb
+                return "[[profiles]]".join(blocks), True
+    return text, False
+
+
 def sync_devices_section(text, name_to_uid):
     """让 [devices] 段里指定设备名的行改用【本次实际使用的 UID】。
 
@@ -226,7 +294,7 @@ def strip_json_comments(text):
     return json.dumps(obj, ensure_ascii=False, indent=2), obj
 
 
-def validate_toml(text, expect_channels=("pwm1", "pwm2")):
+def validate_toml(text, expect_channels=("pwm1", "pwm2"), fixed_expect=None):
     try:
         doc = tomllib.loads(text)
     except Exception as e:
@@ -245,6 +313,8 @@ def validate_toml(text, expect_channels=("pwm1", "pwm2")):
     # profiles 必含 hs-low / hs-standard / hs-high，且 speed_fixed 合法
     profiles = {p.get("uid"): p for p in doc.get("profiles", [])}
     for uid, want in (("hs-low", 25), ("hs-standard", 55), ("hs-high", 100)):
+        if fixed_expect and uid in fixed_expect:
+            want = fixed_expect[uid]
         p = profiles.get(uid)
         if not p:
             die(f"缺少 profile: {uid}")
@@ -394,6 +464,11 @@ def main():
                     help="单风扇机器：只渲染一路（用 --cpu-channel），智能档走 CPU 曲线")
     ap.add_argument("--no-graph", action="store_true",
                     help="不生成 Graph 曲线，智能档退化为 Fixed 兜底")
+    ap.add_argument("--auto-channels", action="store_true",
+                    help="★ 从 --config-dir 的 config.toml [device-settings] 段读取"
+                         "【真机真实通道名】（hwmon 是 fanN，不是 sysfs 的 pwmN）")
+    ap.add_argument("--auto", action="store_true",
+                    help="= --auto-uid + --auto-channels（推荐：全部按真机真值对齐）")
     ap.add_argument("--auto-uid", action="store_true",
                     help="★ 从 --config-dir 的 config.toml [devices] 段按【设备名】"
                          "自动对齐 device UID（修 Mode 在 UI 显示空白 / 风扇不受控）")
@@ -407,6 +482,11 @@ def main():
                     help="机箱温度所在设备的显示名（[devices] 段）")
     ap.add_argument("--out-dir", default="",
                     help="输出目录（默认 /etc/coolercontrol）")
+    ap.add_argument("--fixed-pct", default="",
+                    help="三档固定转速百分比，如 30,60,100（默认 25,55,100）——"
+                         "手调过转速时用它把偏好带进渲染结果")
+    ap.add_argument("--fallback-pct", default="",
+                    help="智能档兜底百分比，如 30,35（默认 35,40）")
     ap.add_argument("--check", action="store_true",
                     help="只做渲染与校验，不写文件")
     ap.add_argument("--backup", action="store_true", default=True,
@@ -472,12 +552,25 @@ def main():
 
     out_dir = args.out_dir or "/etc/coolercontrol"
 
-    # ── ★ UID 自动对齐（--auto-uid）：按设备名反查 daemon 真值 ───────────────
+    # ── ★ 按真机真值自动对齐（--auto / --auto-uid / --auto-channels）─────────
     #   现象：Web UI 打开 Mode 时设备/通道/设置一片空白，或风扇根本不受控。
-    #   这是 UID 漂移的典型症状（JSON/TOML 语法都是对的，只是键对不上设备）。
-    if args.auto_uid:
-        cc_dir = args.config_dir or out_dir
-        cfg_path = os.path.join(cc_dir, "config.toml")
+    #   两大成因：① device UID 漂移；② 【通道名写错】——sysfs 里叫 pwmN，
+    #   而 CoolerControl 的通道名是 fanN，按 pwm1/pwm2 写死必然 join 不上。
+    auto_uid = args.auto_uid or args.auto
+    auto_ch = args.auto_channels or args.auto
+    cc_dir = args.config_dir or out_dir
+    cfg_path = os.path.join(cc_dir, "config.toml")
+    cc_text = ""
+    if auto_uid or auto_ch:
+        try:
+            with open(cfg_path, encoding="utf-8", errors="replace") as f:
+                cc_text = f.read()
+        except OSError as e:
+            die(f"--auto* 需要读取真机 {cfg_path} 作为真值，但读取失败: {e}"
+                "\n  提示：CoolerControl daemon 至少成功启动过一次才会生成它；"
+                "也可用 --config-dir 指定其它目录")
+
+    if auto_uid:
         devmap, err = parse_devices_section(cfg_path)
         if not devmap:
             die(f"--auto-uid 需要 {cfg_path} 的 [devices] 段作为真值，但{err}"
@@ -508,6 +601,36 @@ def main():
                 args.cpu_temp_device_uid = new
             else:
                 case_temp_uid = new
+
+    if auto_ch:
+        dsmap = parse_device_settings(cc_text)
+        chans = dsmap.get(args.device_uid.strip(), {})
+        if not chans:
+            info(f"⚠ [device-settings] 里没有设备 {args.device_uid[:8]}… 的通道，"
+                 "无法自动对齐通道名（保留预设值）")
+        else:
+            off = parse_disabled_channels(cc_text, args.device_uid.strip())
+            usable = [c for c in chans if c not in off]
+            info(f"真机已配置通道: {', '.join(sorted(chans))}"
+                 + (f"（已禁用: {', '.join(sorted(off))}）" if off else ""))
+            # ★ 按通道当前挂的 profile 名推断角色（…cpu…→CPU 风扇，…case…→机箱风扇）
+            guess_cpu = [c for c in usable
+                         if (chans.get(c) or "").lower().find("cpu") >= 0]
+            guess_case = [c for c in usable
+                          if (chans.get(c) or "").lower().find("case") >= 0]
+            if len(guess_cpu) == 1 and len(guess_case) == 1 \
+                    and guess_cpu[0] != guess_case[0]:
+                if args.cpu_channel != guess_cpu[0]:
+                    info(f"★ cpu_channel : {args.cpu_channel or '（空）'} → "
+                         f"{guess_cpu[0]}（该通道当前挂 {chans.get(guess_cpu[0])}）")
+                if args.case_channel != guess_case[0]:
+                    info(f"★ case_channel: {args.case_channel or '（空）'} → "
+                         f"{guess_case[0]}（该通道当前挂 {chans.get(guess_case[0])}）")
+                args.cpu_channel, args.case_channel = guess_cpu[0], guess_case[0]
+            else:
+                info(f"⚠ 无法从 profile 名推断通道角色（cpu={guess_cpu} case={guess_case}），"
+                     f"保留预设；可用 --cpu-channel/--case-channel 在 "
+                     f"{sorted(usable)} 中手工指定")
 
     if not args.device_uid or not args.cpu_channel:
         die("必须提供 --device-uid 与 --cpu-channel（或用 --host <机型> 一键填充）")
@@ -560,8 +683,8 @@ def main():
     cfg_text = read_tpl(TPL_CONFIG)
     # ★ 锚点必须是「下一个块的标题注释行」而不是 [[profiles]]：
     #   曲线块内自带多行注释，用 (?=#) 会提前命中导致删不干净。
-    CPU_HDR = r"# -+ ★ 智能档 pwm1 · CPU 温度曲线"
-    CASE_HDR = r"# -+ ★ 智能档 pwm2 · 机箱温度曲线"
+    CPU_HDR = r"# -+ ★ 智能档 · CPU 风扇通道温度曲线"
+    CASE_HDR = r"# -+ ★ 智能档 · 机箱风扇通道温度曲线"
     CASE_STOP = r"(?=# -+ 智能档兜底（探测不到温度源时使用）)"
     if not use_cpu_graph and not use_case_graph:
         # 两条曲线都删：CPU 头 → 兜底头
@@ -585,8 +708,35 @@ def main():
         args.cpu_temp_device_name: args.cpu_temp_device_uid,
         args.case_temp_device_name: case_temp_uid,
     })
+    # ★ 保留用户在 UI 里手调过的转速（否则一渲染就被打回模板默认值）
+    fixed_expect = {}
+    if args.fixed_pct:
+        vals = [v.strip() for v in args.fixed_pct.split(",")]
+        if len(vals) != 3:
+            die(f"--fixed-pct 需要 3 个值（低速,标准,强劲），实际 {args.fixed_pct!r}")
+        for uid, v in zip(("hs-low", "hs-standard", "hs-high"), vals):
+            if not v.isdigit() or not (0 <= int(v) <= 100):
+                die(f"--fixed-pct 的 {v!r} 不是 0–100 的整数")
+            cfg_text, hit = set_profile_fixed(cfg_text, uid, int(v))
+            if hit:
+                info(f"转速覆盖 {uid} → {v}%")
+            else:
+                info(f"⚠ 未找到 profile {uid}，跳过转速覆盖")
+            fixed_expect[uid] = int(v)
+    if args.fallback_pct:
+        vals = [v.strip() for v in args.fallback_pct.split(",")]
+        if len(vals) != 2:
+            die(f"--fallback-pct 需要 2 个值（CPU兜底,机箱兜底），实际 "
+                f"{args.fallback_pct!r}")
+        for uid, v in zip(("hs-smart-fallback", "hs-case-fallback"), vals):
+            if not v.isdigit() or not (0 <= int(v) <= 100):
+                die(f"--fallback-pct 的 {v!r} 不是 0–100 的整数")
+            cfg_text, hit = set_profile_fixed(cfg_text, uid, int(v))
+            if hit:
+                info(f"兜底覆盖 {uid} → {v}%")
     expect_channels = (cpu_ch, case_ch) if dual else (cpu_ch,)
-    cfg_doc = validate_toml(cfg_text, expect_channels=expect_channels)
+    cfg_doc = validate_toml(cfg_text, expect_channels=expect_channels,
+                            fixed_expect=fixed_expect or None)
 
     # ── 渲染 modes.json ────────────────────────────────────────────────
     modes_raw = read_tpl(TPL_MODES)
@@ -626,9 +776,10 @@ def main():
     fan_desc = (f"双风扇 {cpu_ch}(CPU)+{case_ch}(机箱)" if dual
                 else f"单风扇 {cpu_ch}")
     info(f"完成。{fan_desc}")
-    info(f"  智能档 pwm1 = {'CPU 曲线 hs-cpu-graph' if use_cpu_graph else '兜底 Fixed 35%'}")
+    info(f"  智能档 {cpu_ch} = {'CPU 曲线 hs-cpu-graph' if use_cpu_graph else '兜底 Fixed 35%'}")
     if dual:
-        info(f"  智能档 pwm2 = {'机箱曲线 hs-case-graph' if use_case_graph else '兜底 Fixed 40%'}")
+        info(f"  智能档 {case_ch} = "
+             f"{'机箱曲线 hs-case-graph' if use_case_graph else '兜底 Fixed 40%'}")
     info("下一步：sudo systemctl restart coolercontrold  "
          "（或 docker restart coolercontrol）后打开 http://<NAS>:11987 核对")
     return 0

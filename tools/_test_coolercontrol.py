@@ -4,10 +4,10 @@
 _test_coolercontrol.py —— CoolerControl 配置渲染器回归测试
 
 覆盖 render-config.py 的核心行为（这些都是「错了就静默不生效/风扇失控」的关键路径）：
-  1. 双风扇默认渲染：pwm1→CPU 曲线、pwm2→机箱曲线，两通道都进 device-settings 与每个 Mode
-  2. 单风扇 --single-channel：只剩一路，不再出现 pwm2
+  1. 双风扇默认渲染：fan3→CPU 曲线、fan2→机箱曲线，两通道都进 device-settings 与每个 Mode
+  2. 单风扇 --single-channel：只剩一路，不再出现 fan2
   3. --no-graph：两条 Graph 都被裁掉，智能档指向 Fixed 兜底
-  4. --no-case-graph：只保留 CPU 曲线，pwm2 走 Fixed 兜底
+  4. --no-case-graph：只保留 CPU 曲线，fan2 走 Fixed 兜底
   5. 显式清空机箱温度源（--case-temp-name ""）能覆盖 --host 预设
   6. 校验器能抓出坏配置（温度非单调 / 首点≠temp_min / function_uid 不存在 / Mode 漏通道）
   7. 渲染产物无残留占位符、TOML/JSON 均可解析
@@ -105,21 +105,26 @@ try:
        str(graph_uids(doc)))
     ds = doc.get("device-settings", {})
     chans = list(ds.values())[0]
-    ok("device-settings 覆盖 pwm1+pwm2", set(chans.keys()) == {"pwm1", "pwm2"},
+    ok("device-settings 覆盖 fan3+fan2", set(chans.keys()) == {"fan3", "fan2"},
        str(set(chans.keys())))
-    ok("pwm1 智能档 → hs-cpu-graph", chans["pwm1"].get("profile_uid") == "hs-cpu-graph")
-    ok("pwm2 智能档 → hs-case-graph", chans["pwm2"].get("profile_uid") == "hs-case-graph")
+    ok("fan3 智能档 → hs-cpu-graph", chans["fan3"].get("profile_uid") == "hs-cpu-graph")
+    ok("fan2 智能档 → hs-case-graph", chans["fan2"].get("profile_uid") == "hs-case-graph")
     ok("hs-smart 两路分别指向两条曲线",
-       smart_chans(modes) == {"pwm1": "hs-cpu-graph", "pwm2": "hs-case-graph"},
+       smart_chans(modes) == {"fan3": "hs-cpu-graph", "fan2": "hs-case-graph"},
        str(smart_chans(modes)))
     mc = all_mode_channels(modes)
-    ok("每个 Mode 都覆盖 pwm1+pwm2",
-       all(v == {"pwm1", "pwm2"} for v in mc.values()), str(mc))
+    ok("每个 Mode 都覆盖 fan3+fan2",
+       all(v == {"fan3", "fan2"} for v in mc.values()), str(mc))
     ok("无残留占位符", not re.findall(r"@[A-Z_]+@", cfg + mtext),
        str(set(re.findall(r"@[A-Z_]+@", cfg + mtext))))
-    ok("CPU 曲线温度源 = i3-N305",
-       any("i3-N305" in str(p.get("temp_source", {}).get("temp_name", ""))
-           for p in doc["profiles"] if p.get("uid") == "hs-cpu-graph"))
+    # ★ temp_name 必须是【传感器名】(temp1)，不是设备显示名（真机实测修正）
+    ok("CPU 曲线温度源 = i3-N305 设备的 temp1",
+       next(p for p in doc["profiles"] if p["uid"] == "hs-cpu-graph")["temp_source"]
+       == {"temp_name": "temp1",
+           "device_uid": "336d28e0c7580fdf9135eb62a4626ff7c3cbfdfef20a61d19fc92198f26bc7bd"})
+    ok("CPU 曲线 temp_name 不是设备显示名（防止退回旧写法）",
+       "i3-N305" not in str(next(p for p in doc["profiles"]
+                                 if p["uid"] == "hs-cpu-graph")["temp_source"]["temp_name"]))
     ok("机箱曲线温度源 = i915 的 temp1",
        next(p for p in doc["profiles"] if p["uid"] == "hs-case-graph")["temp_source"]
        == {"temp_name": "temp1",
@@ -139,14 +144,14 @@ try:
     ok("rc = 0", rc == 0, out[-400:])
     doc, modes, cfg, mtext = load(d)
     chans = list(doc.get("device-settings", {}).values())[0]
-    ok("device-settings 只有 pwm1", set(chans.keys()) == {"pwm1"}, str(set(chans.keys())))
+    ok("device-settings 只有 fan3", set(chans.keys()) == {"fan3"}, str(set(chans.keys())))
     ok("单风扇智能档 → hs-cpu-graph",
-       smart_chans(modes) == {"pwm1": "hs-cpu-graph"}, str(smart_chans(modes)))
+       smart_chans(modes) == {"fan3": "hs-cpu-graph"}, str(smart_chans(modes)))
     ok("机箱曲线已移除", "hs-case-graph" not in graph_uids(doc))
     ok("机箱兜底 profile 已移除",
        not any(p["uid"] == "hs-case-fallback" for p in doc["profiles"]))
-    ok("每个 Mode 只覆盖 pwm1",
-       all(v == {"pwm1"} for v in all_mode_channels(modes).values()))
+    ok("每个 Mode 只覆盖 fan3",
+       all(v == {"fan3"} for v in all_mode_channels(modes).values()))
 
     # ── 3. --no-graph ───────────────────────────────────────────────────
     sec("[3] --no-graph（两路都走 Fixed 兜底）")
@@ -156,9 +161,9 @@ try:
     doc, modes, cfg, mtext = load(d)
     ok("没有任何 Graph profile", graph_uids(doc) == set(), str(graph_uids(doc)))
     ok("智能档两路都指向兜底",
-       smart_chans(modes) == {"pwm1": "hs-smart-fallback", "pwm2": "hs-case-fallback"},
+       smart_chans(modes) == {"fan3": "hs-smart-fallback", "fan2": "hs-case-fallback"},
        str(smart_chans(modes)))
-    ok("仍覆盖双通道", all(v == {"pwm1", "pwm2"}
+    ok("仍覆盖双通道", all(v == {"fan3", "fan2"}
                       for v in all_mode_channels(modes).values()))
 
     # ── 4. --no-case-graph ──────────────────────────────────────────────
@@ -168,8 +173,8 @@ try:
     ok("rc = 0", rc == 0, out[-400:])
     doc, modes, cfg, mtext = load(d)
     ok("只剩 CPU 曲线", graph_uids(doc) == {"hs-cpu-graph"}, str(graph_uids(doc)))
-    ok("pwm1 走曲线、pwm2 走兜底",
-       smart_chans(modes) == {"pwm1": "hs-cpu-graph", "pwm2": "hs-case-fallback"},
+    ok("fan3 走曲线、fan2 走兜底",
+       smart_chans(modes) == {"fan3": "hs-cpu-graph", "fan2": "hs-case-fallback"},
        str(smart_chans(modes)))
 
     # ── 5. 显式清空机箱温度源（覆盖 --host 预设）────────────────────────
@@ -181,8 +186,8 @@ try:
     doc, modes, cfg, mtext = load(d)
     ok("机箱曲线被裁掉（因无温度源）", graph_uids(doc) == {"hs-cpu-graph"},
        str(graph_uids(doc)))
-    ok("pwm2 智能档 → hs-case-fallback",
-       smart_chans(modes).get("pwm2") == "hs-case-fallback",
+    ok("fan2 智能档 → hs-case-fallback",
+       smart_chans(modes).get("fan2") == "hs-case-fallback",
        str(smart_chans(modes)))
 
     # ── 6. 校验器能抓出坏配置 ────────────────────────────────────────────
@@ -190,7 +195,7 @@ try:
     # 6a. 首点温度 ≠ temp_min
     bad = open(TPL_CONFIG, encoding="utf-8").read()
     bad = (bad.replace("@DEVICE_UID@", "a" * 64)
-              .replace("@CPU_CHANNEL@", "pwm1").replace("@CASE_CHANNEL@", "pwm2")
+              .replace("@CPU_CHANNEL@", "fan3").replace("@CASE_CHANNEL@", "fan2")
               .replace("@CPU_TEMP_NAME@", "Core").replace("@CPU_TEMP_DEVICE_UID@", "b" * 64)
               .replace("@CASE_TEMP_NAME@", "temp1").replace("@CASE_TEMP_DEVICE_UID@", "c" * 64)
               .replace("@CPU_SMART_PROFILE@", "hs-cpu-graph")
@@ -220,17 +225,17 @@ try:
     expect_die(lambda: rc_mod.validate_toml(bad_fn), "拒绝「function_uid 不存在」")
     # 6d. Mode 漏通道
     modes_obj = json.loads(open(TPL_MODES, encoding="utf-8").read().replace(
-        "@DEVICE_UID@", "a" * 64).replace("@CPU_CHANNEL@", "pwm1").replace(
-        "@CASE_CHANNEL@", "pwm2").replace("@CPU_SMART_PROFILE@", "hs-cpu-graph").replace(
+        "@DEVICE_UID@", "a" * 64).replace("@CPU_CHANNEL@", "fan3").replace(
+        "@CASE_CHANNEL@", "fan2").replace("@CPU_SMART_PROFILE@", "hs-cpu-graph").replace(
         "@CASE_SMART_PROFILE@", "hs-case-graph"))
     modes_obj.pop("_comment", None)
-    # 删掉 hs-smart 里的 pwm2
+    # 删掉 hs-smart 里的 fan2
     for m in modes_obj["modes"]:
         if m["uid"] == "hs-smart":
             for dev in m["all_device_settings"].values():
-                dev.pop("pwm2", None)
-    expect_die(lambda: rc_mod.validate_modes(modes_obj, expect_channels=("pwm1", "pwm2")),
-               "拒绝「Mode 漏掉 pwm2 通道」")
+                dev.pop("fan2", None)
+    expect_die(lambda: rc_mod.validate_modes(modes_obj, expect_channels=("fan3", "fan2")),
+               "拒绝「Mode 漏掉 fan2 通道」")
 
     # ── 7. --list-hosts / 参数校验 ──────────────────────────────────────
     sec("[7] CLI 行为")
@@ -238,17 +243,17 @@ try:
                        capture_output=True, text=True)
     ok("--list-hosts rc=0", p.returncode == 0)
     ok("--list-hosts 含 hs-afs-r1", "hs-afs-r1" in p.stdout)
-    ok("--list-hosts 显示机箱通道 pwm2", "pwm2" in p.stdout)
+    ok("--list-hosts 显示机箱通道 fan2", "fan2" in p.stdout)
     p = subprocess.run([sys.executable, RENDER, "--host", "no-such-host"],
                        capture_output=True, text=True)
     ok("未知机型 rc≠0", p.returncode != 0)
     ok("未知机型给出可选列表", "hs-afs-r1" in (p.stdout + p.stderr))
     p = subprocess.run([sys.executable, RENDER,
-                        "--device-uid", "short", "--cpu-channel", "pwm1"],
+                        "--device-uid", "short", "--cpu-channel", "fan3"],
                        capture_output=True, text=True)
     ok("非法 device-uid rc≠0", p.returncode != 0)
     p = subprocess.run([sys.executable, RENDER, "--host", "hs-afs-r1",
-                        "--cpu-channel", "pwm1", "--case-channel", "pwm1"],
+                        "--cpu-channel", "fan3", "--case-channel", "fan3"],
                        capture_output=True, text=True)
     ok("双通道同名 rc≠0", p.returncode != 0)
     # ── 8. --auto-uid：device UID 漂移自愈 ───────────────────────────────
@@ -317,6 +322,65 @@ try:
     ok("诊断会比对 daemon 真值 [devices] 段", "[devices]" in ptxt)
     ok("诊断会提示 --auto-uid 修复", "--auto-uid" in ptxt)
     ok("诊断能识别未渲染的占位符", "未渲染" in ptxt)
+
+    # ── 10. --auto-channels：真机通道名是 fanN，不是 sysfs 的 pwmN ────────
+    #  ★ 真机实测（用户 NAS 的 /etc/coolercontrol/config.toml）：
+    #    [device-settings.71b063a3…] fan2 = { profile_uid = "hs-case-graph" }
+    #                                fan3 = { profile_uid = "hs-cpu-graph" }
+    #    ⇒ CoolerControl 的通道名 = fanN；按 pwm1/pwm2 写死 ⇒ UI 里 Mode 内容空白。
+    sec("[10] --auto-channels（真机通道名 fanN）")
+    real_dir = os.path.join(TMPROOT, "real")
+    os.makedirs(real_dir, exist_ok=True)
+    real_cfg = """[devices]
+71b063a3608e1f4f066afff5ba8ad37f92375b73d6005164d9e16752347f8742 = "it8613"
+336d28e0c7580fdf9135eb62a4626ff7c3cbfdfef20a61d19fc92198f26bc7bd = "Intel(R) Core(TM) i3-N305"
+58cea05ead42a096567b4a1d62ed932c28b0a81abdf9ded743e0645afc0a4818 = "i915"
+
+[device-settings.71b063a3608e1f4f066afff5ba8ad37f92375b73d6005164d9e16752347f8742]
+fan2 = { profile_uid = "hs-case-graph" }
+fan3 = { profile_uid = "hs-cpu-graph" }
+
+[settings.71b063a3608e1f4f066afff5ba8ad37f92375b73d6005164d9e16752347f8742.channel_settings]
+fan5 = { disabled = true }
+fan4 = { disabled = true }
+"""
+    with open(os.path.join(real_dir, "config.toml"), "w", encoding="utf-8") as f:
+        f.write(real_cfg)
+    d3 = os.path.join(TMPROOT, "autoch")
+    rc, out = run_render(["--host", "hs-afs-r1", "--auto-channels",
+                          "--config-dir", real_dir], d3)
+    ok("--auto-channels rc=0", rc == 0, out[-500:])
+    doc, modes, cfg, mtext = load(d3)
+    ok("CPU 通道学到 fan3", set(doc["device-settings"].values().__iter__().__next__())
+       >= {"fan3"}, str(list(doc["device-settings"].values())[0].keys()))
+    ok("机箱通道学到 fan2", "fan2" in list(doc["device-settings"].values())[0])
+    ok("hs-smart: fan3→CPU 曲线、fan2→机箱曲线",
+       smart_chans(modes) == {"fan3": "hs-cpu-graph", "fan2": "hs-case-graph"},
+       str(smart_chans(modes)))
+    ok("每个 Mode 都覆盖 fan3+fan2",
+       all(v == {"fan3", "fan2"} for v in all_mode_channels(modes).values()))
+    # --auto = 两者都做（这份真机 config 没有漂移，通道应保持不变）
+    d4 = os.path.join(TMPROOT, "autoboth")
+    rc, out = run_render(["--host", "hs-afs-r1", "--auto",
+                          "--config-dir", real_dir], d4)
+    ok("--auto rc=0", rc == 0, out[-500:])
+    doc4, modes4, _, _ = load(d4)
+    ok("--auto 也学到 fan3/fan2",
+       set(list(doc4["device-settings"].values())[0]) == {"fan2", "fan3"})
+    ok("--auto 保留真机 device_uid",
+       "71b063a3608e1f4f066afff5ba8ad37f92375b73d6005164d9e16752347f8742"
+       in doc4["device-settings"])
+    # 禁用通道不应被选中
+    ds_text = open(os.path.join(d4, "config.toml"), encoding="utf-8").read()
+    ok("不会把已禁用的 fan4/fan5 当通道",
+       not re.search(r'"fan[45]"\s*=\s*\{', ds_text.split("[device-settings]")[1]))
+
+    # ── 11. 探测脚本能识别「通道名对不上」 ──────────────────────────────
+    sec("[11] probe-coolercontrol.sh 的通道检查")
+    ok("诊断会列出真机已知通道", "真机已知通道" in ptxt)
+    ok("诊断能报「不是真机已知通道」", "不是真机已知通道" in ptxt)
+    ok("诊断提示 --auto（而非只提示 --auto-uid）", "--auto --config-dir" in ptxt)
+    ok("探测脚本说明通道名是 fanN 而非 pwmN", "不是 sysfs 里的 pwmN" in ptxt)
 
 finally:
     shutil.rmtree(TMPROOT, ignore_errors=True)

@@ -27,8 +27,14 @@ CoolerControl 的配置文件即可。
 
 | 通道 | 风扇 | 温度源 | 对应 Profile |
 | --- | --- | --- | --- |
-| `pwm1` | CPU 风扇 | CPU 核心（Intel Core i3-N305） | 智能→`hs-cpu-graph` |
-| `pwm2` | 机箱风扇 | 核显 i915（机箱热源，转码时升温） | 智能→`hs-case-graph` |
+| `fan3` | CPU 风扇 | CPU 核心（i3-N305，**传感器名 `temp1`**） | 智能→`hs-cpu-graph` |
+| `fan2` | 机箱风扇 | 核显 i915（传感器名 `temp1`） | 智能→`hs-case-graph` |
+
+> ★★★ **通道名是 `fanN`，不是 sysfs 里的 `pwmN`！**
+> CoolerControl 对 hwmon 设备一律用 `fan1…fanN` 作通道名；真机 it8613 暴露
+> fan1..fan5，其中 **fan4/fan5 已在 UI 禁用**，实际用 fan3(CPU)/fan2(机箱)。
+> **写错通道名与 UID 漂移症状完全一样** —— UI 里 Mode 的「设备/通道/设置」一片空白。
+> 别手抄，用 `--auto-channels` / `--auto` 从真机 `[device-settings]` 段取真值。
 
 | 界面档位 | `fan_mode` | CoolerControl Mode | Profile（两路） | 落地形态 |
 | --- | --- | --- | --- | --- |
@@ -37,7 +43,7 @@ CoolerControl 的配置文件即可。
 | 标准 | `3` | `hs-standard` | `hs-standard`（两路共用） | Fixed **55%** |
 | 强劲 | `4` | `hs-high` | `hs-high`（两路共用） | Fixed **100%** |
 
-> ★ **每个 Mode 必须同时覆盖 pwm1 与 pwm2**。`activate_mode()` 会把
+> ★ **每个 Mode 必须同时覆盖两个通道（fan3+fan2）**。`activate_mode()` 会把
 > Mode **未覆盖**的通道 Reset 掉，只写一路会导致另一路转速失控。`render-config.py`
 > 的 `validate_modes()` 会强制校验这一点。
 
@@ -51,7 +57,7 @@ CoolerControl 的配置文件即可。
 >   机箱风扇服务的是 6 块机械大盘与整体风道，对高温最敏感，所以**起调点比 CPU 曲线低、
 >   上限直接打到 100%**；核显空闲时停转以彻底消除噪声。
 > - **整形函数 `hs-fan-fn`**（Standard）：`bypass_min_at_extremes = true` 是关键 ——
->   它允许曲线最左端**不抬到 `duty_minimum`**，这样 pwm2 首点的 0% 才能真正停转。
+>   它允许曲线最左端**不抬到 `duty_minimum`**，这样机箱曲线首点的 0% 才能真正停转。
 >   `step_size_max_*` + `response_delay = 2.0` 限制单次调整幅度，防转速抖动。
 >
 > **兜底**：探测不到温度源时自动降级 —— CPU 侧 → `hs-smart-fallback`（Fixed 35%）、
@@ -127,7 +133,7 @@ sudo chmod +x /screen/tools/coolercontrol/*.sh /screen/tools/coolercontrol/*.py
 
 # ── 2. 探测真机 ───────────────────────────────────────────
 sudo /screen/tools/coolercontrol/probe-coolercontrol.sh
-#    输出第 3 节给你 device_uid；第 5 节列出所有 pwm 通道（双风扇取 pwm1+pwm2）；
+#    ★ 输出 §3 给你 device_uid；§5.1 给你【真实通道名 fanN】（★ 不是 pwmN）；
 #    第 6 节给你 CPU 温度传感器名。
 
 # ── 3. 渲染配置 ───────────────────────────────────────────
@@ -135,22 +141,27 @@ sudo /screen/tools/coolercontrol/probe-coolercontrol.sh
 sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 \
       --out-dir /etc/coolercontrol
 #    查看内置机型：render-config.py --list-hosts
-#    ⇒ 默认渲染为【双风扇】：pwm1→CPU 曲线、pwm2→机箱(i915)曲线
+#    ⇒ 默认渲染为【双风扇】：fan3→CPU 曲线、fan2→机箱(i915)曲线
+#
+# ★ 更推荐（UID 与通道名都按真机真值对齐，不手抄）：
+# sudo render-config.py --host hs-afs-r1 --auto --config-dir /etc/coolercontrol
+#      --fixed-pct 30,60,100     保留手调过的三档转速（默认 25,55,100）
+#      --fallback-pct 30,35      保留手调过的兜底转速（默认 35,40）
 
 # 渲染模式的几种开关（按需）：
-#   --single-channel     单风扇机器：只渲染一路（默认把 case 通道当成 pwm2，
-#                        单风扇时必须加，否则会多写一路不存在的 pwm2）
-#   --no-case-graph      保留双通道但机箱侧不用曲线（pwm2 智能档走 Fixed 40%）
+#   --single-channel     单风扇机器：只渲染一路
+#                        （默认会写第二路，单风扇时必须加，否则多写一路不存在的通道）
+#   --no-case-graph      保留双通道但机箱侧不用曲线（机箱通道智能档走 Fixed 40%）
 #   --no-graph           两路智能档都走 Fixed 兜底（测试/无温度传感器时用）
 
 # 等价的手工写法（预设的数字来源，便于其它机型参照）：
 #     风扇设备 it8613      = 71b063a3…8742
 #     CPU 温度 i3-N305     = 336d28e0…c7bd
 #     机箱温度 i915        = 58cea05e…4818
-#     CPU 通道（hwmon）    = pwm1        机箱通道 = pwm2
+#     CPU 通道（CoolerControl）= fan3     机箱通道 = fan2
 # sudo /screen/tools/coolercontrol/render-config.py \
 #       --device-uid 71b063a3…8742 \
-#       --cpu-channel pwm1 --case-channel pwm2 \
+#       --cpu-channel fan3 --case-channel fan2 \
 #       --cpu-temp-name "Intel(R) Core(TM) i3-N305" \
 #       --cpu-temp-device-uid 336d28e0…c7bd \
 #       --case-temp-name "temp1" \
@@ -160,7 +171,7 @@ sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 \
 #    ★ 其它机型：先用 probe-coolercontrol.sh 取真实 uid/channel 再替换
 #    ★ 风扇设备认准 hwmon 的 name = it8613 / nct67xx 这类『超级 I/O』芯片；
 #      CPU 温度认准 name = coretemp / Intel(R) Core(TM) … / acpitz
-#    ★ 若两路风扇接线相反（pwm1 接的是机箱扇），用 --cpu-channel pwm2 --case-channel pwm1 交换。
+#    ★ 若两路接线相反（fan3 实际接的是机箱扇），把 --cpu-channel/--case-channel 交换即可。
 #    ★ 渲染后务必核对：两路 pwm 是否真的在动（见第 4 步）。
 
 # ── 4. 手工验证（重启 daemon 后风扇应立刻变档）────────────
@@ -199,7 +210,7 @@ sudo systemctl daemon-reload && sudo systemctl restart hiksemi-sub
 
 | # | 要点 | 说明 |
 | --- | --- | --- |
-| 1 | `[device-settings.<uid>]` 通道值**必须是内联表** | `pwm1 = { profile_uid = "..." }` ✅<br>`[device-settings.<uid>.pwm1]` 子表 ❌（daemon 读不到） |
+| 1 | `[device-settings.<uid>]` 通道值**必须是内联表** | `fan3 = { profile_uid = "..." }` ✅<br>`[device-settings.<uid>.fan3]` 子表 ❌（daemon 读不到） |
 | 2 | `speed_fixed` 与 `profile_uid` **互斥** | 设置其一会自动清空另一个；多键共存时优先级 `SpeedFixed → Profile → Lighting → Lcd` |
 | 3 | `temp_source` 是**内联表** | `{ temp_name = "...", device_uid = "..." }`，两个字段都必需 |
 | 4 | `temp_min` / `temp_max` 必须是**浮点** | 写 `30.0`，写 `30` 会被判类型错 |
@@ -210,6 +221,9 @@ sudo systemctl daemon-reload && sudo systemctl restart hiksemi-sub
 | 9 | `apply_on_boot = true` | daemon 启动时重新应用 `[device-settings]` 已存设置 |
 | 10 | ★★ **`[legacy690]` 段必须存在（可为空表）** | daemon 启动 `check_readable()` 第一个调用 `legacy690_ids()` 就**硬索引** `["legacy690"]`——toml_edit 对不存在的键直接 panic `index not found`（真机实测：`config.rs:480` 启动即崩）。官方默认配置含此空表（Asetek 690LC 兼容开关），普通设备留空即可。**daemon 认定完整段集 = devices / legacy690 / device-settings / profiles / functions / settings**，模板与渲染校验均已锁定 |
 | 11 | ★★ **device UID 会漂移** | UID 是 daemon 按设备属性算的 sha256，**daemon 升级 / 内核 hwmon 变化都会让它变**。漂移后 `modes.json` 的 `all_device_settings` 键对不上任何已知设备 ⇒ Web UI 打开 Mode 时「设备/通道/设置」**一片空白**（JSON 语法完全正确，最容易误判成模板错）；`[device-settings]` 同样失效 ⇒ 风扇不受控。daemon 每次启动都会用真值重写 `config.toml` 的 `[devices]` 段 ⇒ 那是唯一权威来源，用 `render-config.py --auto-uid` 按设备名重新对齐即可（详见 6.4） |
+| 12 | ★★★ **通道名是 `fanN`，不是 sysfs 的 `pwmN`** | CoolerControl 对 hwmon 设备一律用 `fan1…fanN` 命名通道。本机 it8613 实际可控通道 = **`fan3`(CPU) / `fan2`(机箱)**（fan4/fan5 已禁用）。**按 `pwm1/pwm2` 写死 ⇒ UI 里 Mode 内容空白，症状与 UID 漂移一模一样**（真机踩过）。通道名的唯一权威来源是 `[device-settings.<uid>]` 段，用 `--auto-channels` 自动取（详见 §2 / §6.4） |
+| 13 | ★★ **`temp_name` 是传感器名，不是设备显示名** | 填 `temp1`（对应 hwmon 的 `temp1_input`），填设备名（如 `Intel(R) Core(TM) i3-N305`）会导致温度源匹配不上。两个设备的传感器可能都叫 `temp1`，靠 `device_uid` 区分 |
+| 14 | ★ **Mode 的 uid 可能被换成随机 UUID** | 在 Web UI 里手工新建的 Mode，uid 是 `1a700658-…` 这种 UUID，不是 `hs-smart`。`apply-mode.sh` 找不到目标 uid 时会**按名字前缀回退匹配**（`hs 智能/低速/标准/强劲`），但推荐直接用渲染产物的语义 uid |
 
 ### 6.1 反序列化方式（为什么键是蛇形）
 
@@ -242,7 +256,7 @@ daemon **不使用** `serde` derive 直接反序列化 `config.toml`，
       "name": "hs 强劲 100%",
       "all_device_settings": {
         "<device_uid>": {
-          "pwm1": { "channel_name": "pwm1", "profile_uid": "hs-high" }
+          "fan3": { "channel_name": "fan3", "profile_uid": "hs-high" }
         }
       }
     }
@@ -269,8 +283,13 @@ Mode { uid, name, all_device_settings: { <device_uid>: { <channel>: Setting } } 
 Setting = { channel_name, profile_uid }        # 与 modes.rs / api/modes.rs 一致
 ```
 
-空白只有一种解释：**`all_device_settings` 的键不是 daemon 当前认识的设备**
-（UI 用设备表做 join，对不上就直接不显示）。也就是 device UID 漂移。
+空白只有两种解释（**都是「键/名对不上」，JSON 本身没错**）：
+
+1. **`all_device_settings` 的键不是 daemon 当前认识的设备** ⇒ device UID 漂移；
+2. **通道名写错** ⇒ ★★ 真机实测最多的一种：CoolerControl 对 hwmon 设备的
+   通道名是 **`fanN`，不是 sysfs 里的 `pwmN`**。本机 it8613 实际是
+   **`fan3`(CPU) / `fan2`(机箱)**（fan4/fan5 已在 UI 禁用）。
+   UI 拿「设备表 + 通道表」做 join，两层任一对不上就不显示。
 
 一步诊断（只读，不改任何文件）：
 
@@ -285,15 +304,17 @@ sudo /screen/tools/coolercontrol/probe-coolercontrol.sh modes
 
 | 诊断结论 | 含义 | 处置 |
 | --- | --- | --- |
-| UID 与真值对不上 | **UID 漂移**（最常见） | 按提示跑 `--auto-uid` |
+| **引用了真机不存在的通道** | ★ 通道名写错（如写了 `pwm1/pwm2`，真机是 `fan3/fan2`） | 按提示跑 `--auto-channels` |
+| UID 与真值对不上 | **UID 漂移** | 按提示跑 `--auto-uid` |
 | 设备键不是 64 位 hex | `modes.json` **没渲染过**（还是 `@DEVICE_UID@`） | 先渲染再重启 daemon |
 | 引用了不存在的 profile | `config.toml` 与 `modes.json` 版本不匹配 | 重新渲染两份（render 是一起写的） |
 | 全部命中 | 内容层面没问题 | 查 docker 挂载路径 / 有没有重启 daemon / UI 硬刷新（Ctrl+F5，前端会缓存设备表） |
 
-修一条命令：
+修一条命令（`--auto` = UID + 通道名全部按真机真值对齐）：
 
 ```bash
-sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 --auto-uid
+sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 --auto \
+      --fixed-pct 30,60,100 --fallback-pct 30,35     # 可选：保留手调过的转速
 sudo systemctl restart coolercontrold          # 或 docker restart coolercontrol
 sudo /screen/tools/coolercontrol/probe-coolercontrol.sh modes   # 复查应全绿
 ```
@@ -301,11 +322,17 @@ sudo /screen/tools/coolercontrol/probe-coolercontrol.sh modes   # 复查应全�
 **`--auto-uid` 做了什么**：读 `/etc/coolercontrol/config.toml` 的 `[devices]` 段
 （daemon 每次启动用真值重写 = 唯一权威来源），按**设备名**反查 UID：
 
-| 槽位 | 设备名 | 影响 |
+| 槽位 | 设备名 / 来源 | 影响 |
 | --- | --- | --- |
 | `device_uid` | `it8613` | modes.json 的键 + `[device-settings]` |
 | CPU 温度 | `Intel(R) Core(TM) i3-N305` | `hs-cpu-graph` 的 `temp_source.device_uid` |
 | 机箱温度 | `i915` | `hs-case-graph` 的 `temp_source.device_uid` |
+| **`cpu_channel` / `case_channel`** | **`[device-settings.<uid>]` 段里 daemon 实际写入的通道** | modes.json 与 `[device-settings]` 的通道名（`fan3` / `fan2`） |
+
+通道角色怎么认：`--auto-channels` 看每个通道**当前挂的 profile 名**来推断
+（`hs-cpu-graph` → CPU 风扇、`hs-case-graph` → 机箱风扇），
+并自动跳过 `[settings.<uid>.channel_settings]` 里 `disabled = true` 的通道。
+推断不出来时只提示、**不擅自改**，需手工指定。
 
 三个槽位同时对齐，`[devices]` 段也会同步改写（否则产物内部自相矛盾：
 `[devices]` 是旧 UID、`[device-settings]` 是新 UID，排查脚本会再次误报）。
@@ -350,7 +377,7 @@ CoolerControl 的 REST API 需要处理 token / 会话，且路径随版本变�
 **功能阶段：**
 
 - [ ] `probe-coolercontrol.sh` 能打印出 64 位 `device_uid`
-- [ ] `probe-coolercontrol.sh` 第 5 节能看到 `pwm1`（或实际通道名）
+- [ ] `probe-coolercontrol.sh` §5.1 能打印出 `[device-settings]` 里的真实通道名（fanN）
 - [ ] `render-config.py --check` 无报错，profiles 数为 6（含兜底）
 - [ ] `render-config.py --out-dir /etc/coolercontrol` 写入成功且原有文件已备份
 - [ ] `apply-mode.sh 4` 后**风扇转速明显上升**（听感 / `cat /sys/class/hwmon/*/pwm1`）
