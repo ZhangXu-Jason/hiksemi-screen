@@ -445,6 +445,170 @@ def validate_modes(obj, expect_uids=("hs-smart", "hs-low", "hs-standard", "hs-hi
     return obj
 
 
+# ── ★ 与「已存在的 modes.json」合并（--merge-modes）────────────────────────
+#   痛点：用户在 CoolerControl Web UI 里【自己新建】的 Mode，uid 是随机 UUID。
+#   直接覆盖 modes.json ⇒ 用户 UI 里那 4 个模式全没了（虽然名字一模一样）。
+#   更糟的是：用户手工往模式里填内容时极易填错 —— 真机就出现过
+#   「名字叫 hs 低速 25%，内容却挂着 hs-standard（60%）」这种自相矛盾，
+#   于是「屏幕切低速 → 实际跑 60%」，看起来像 bug，其实是数据错了。
+#   --merge-modes <现有文件> 让渲染产物【继承】现有 Mode 的 uid / name / order，
+#   只把内容（通道 / profile / 转速）换成渲染结果 ⇒ 内容正确 + UI 模式不丢。
+TIER_PROFILE = {5: "hs-smart", 2: "hs-low", 3: "hs-standard", 4: "hs-high"}
+TIER_LABEL = {5: "智能", 2: "低速", 3: "标准", 4: "强劲"}
+TIER_KEYS = {
+    5: ("hs 智能", "智能", "smart", "auto", "自动"),
+    2: ("hs 低速", "低速", "low", "静音", "quiet", "silent"),
+    3: ("hs 标准", "标准", "standard", "normal", "medium", "常规"),
+    4: ("hs 强劲", "强劲", "high", "full", "性能", "max", "turbo"),
+}
+HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _nname(s):
+    return re.sub(r"\s+", "", str(s or "")).lower()
+
+
+def _mode_profiles(mode):
+    """收集一个 Mode 里所有 channel 引用的 profile uid"""
+    out = set()
+    for dev in (mode.get("all_device_settings") or {}).values():
+        if not isinstance(dev, dict):
+            continue
+        for st in dev.values():
+            if isinstance(st, dict) and st.get("profile_uid"):
+                out.add(str(st["profile_uid"]))
+    return out
+
+
+def _tier_by_name(mode, claimed):
+    """按 Mode 名字认领档位（前缀优先，其次关键词）。认不出返回 None。"""
+    name = _nname(mode.get("name"))
+    if not name:
+        return None
+    for tier in FAN_MODE_ORDER:                 # 前缀优先（"hs 低速…"）
+        if tier not in claimed and _nname(TIER_KEYS[tier][0]) in name:
+            return tier
+    for tier in FAN_MODE_ORDER:                 # 再退到关键词
+        if tier in claimed:
+            continue
+        for key in TIER_KEYS[tier][1:]:
+            if _nname(key) in name:
+                return tier
+    return None
+
+
+def _tier_by_content(mode, claimed):
+    """按 Mode 现在挂的 profile 认领档位（名字看不出时才用）。"""
+    profs = _mode_profiles(mode)
+    for tier in FAN_MODE_ORDER:
+        if tier not in claimed and TIER_PROFILE[tier] in profs:
+            return tier
+    return None
+
+
+def merge_modes(modes_obj, existing, fixed_pct=None, rename=False):
+    """把渲染产物的 4 个档位 Mode 与 existing 对齐（继承 uid / name / order）。
+
+    返回 (档位→最终 uid 的 dict, 保留的额外 Mode 数, 丢弃的额外 Mode 数)
+    """
+    emodes = [m for m in (existing.get("modes") or []) if isinstance(m, dict)]
+    by_uid = {m.get("uid"): m for m in emodes}
+    assigned, claimed = {}, set()
+
+    # ① 渲染 uid 原样还在（用户没改过）→ 直接认领
+    for m in modes_obj.get("modes", []):
+        u = m.get("uid")
+        t = next((k for k, v in DEFAULT_UIDS.items() if v == u), None)
+        if t is not None and t not in claimed and u in by_uid:
+            assigned[t] = by_uid[u]
+            claimed.add(t)
+
+    # ② 名字认领 → 再退到内容认领（★ 名字优先：真机出现过「名字叫 hs 低速 25%、
+    #    内容却挂着 hs-standard(60%)」的自相矛盾，此时必须信名字，才能把内容纠正过来）
+    for fn in (_tier_by_name, _tier_by_content):
+        for m in emodes:
+            if any(m is a for a in assigned.values()):
+                continue
+            t = fn(m, claimed)
+            if t is not None:
+                assigned[t] = m
+                claimed.add(t)
+
+    uid_map = {}
+    merged = 0
+    for m in modes_obj.get("modes", []):
+        old_u = m.get("uid")
+        t = next((k for k, v in DEFAULT_UIDS.items() if v == old_u), None)
+        em = assigned.get(t)
+        if em is None:
+            continue
+        if em.get("uid"):
+            m["uid"] = em["uid"]
+        if em.get("name") and not rename:
+            m["name"] = em["name"]
+        if rename and t in (2, 3, 4) and fixed_pct:
+            pct = fixed_pct.get(DEFAULT_UIDS[t])
+            if pct is not None:
+                m["name"] = f"hs {TIER_LABEL[t]} {pct}%"
+        uid_map[old_u] = m["uid"]
+        merged += 1
+        if m["uid"] != old_u:
+            info(f"合并档位 {t}（{TIER_LABEL[t]}）：沿用 UI 里的 "
+                 f"{str(m['uid'])[:12]}…（原来会是 {old_u}）")
+
+    # ③ 额外 Mode：属于用户自己的东西 —— 干净就留，脏（占位符/缺通道）就丢并告警
+    kept, dropped = [], 0
+    bad_names = []
+    for m in emodes:
+        if any(m is a for a in assigned.values()):
+            continue
+        devs = m.get("all_device_settings") or {}
+        dirty = any(not HEX64.fullmatch(str(k)) for k in devs)
+        for dev in devs.values():
+            if isinstance(dev, dict):
+                dirty = dirty or any(not HEX64.fullmatch(str(k)) for k in dev)
+        if dirty:
+            dropped += 1
+            bad_names.append(str(m.get("name") or m.get("uid"))[:24])
+        else:
+            kept.append(m)
+    modes_obj["modes"].extend(kept)
+    if dropped:
+        info(f"⚠ 丢弃 {dropped} 个未渲染的额外 Mode（含占位符键，daemon 认不出）："
+             f"{', '.join(bad_names)}")
+    if kept:
+        info(f"保留 {len(kept)} 个额外的自定义 Mode（内容不动）")
+
+    # ④ order / current_active_mode / previous_active_mode 跟着映射
+    order, seen = [], set()
+    for u in (existing.get("order") or []):
+        nu = uid_map.get(u, u)
+        if nu not in seen:
+            order.append(nu)
+            seen.add(nu)
+    for m in modes_obj["modes"]:
+        if m["uid"] not in seen:
+            order.append(m["uid"])
+            seen.add(m["uid"])
+    valid = {m["uid"] for m in modes_obj["modes"]}
+    modes_obj["order"] = [u for u in order if u in valid]
+    cur = existing.get("current_active_mode")
+    if cur in valid:
+        modes_obj["current_active_mode"] = cur
+    elif cur and uid_map.get(cur) in valid:
+        modes_obj["current_active_mode"] = uid_map[cur]
+    prev = existing.get("previous_active_mode")
+    modes_obj["previous_active_mode"] = uid_map.get(prev, prev) if prev else prev
+    if modes_obj["previous_active_mode"] not in valid:
+        modes_obj["previous_active_mode"] = None
+    # ★ 兜底：原有激活项被丢弃（或本来就悬空）时回落到智能档，
+    #   否则 current_active_mode 会指向不存在的 Mode 而让校验失败。
+    if modes_obj.get("current_active_mode") not in valid:
+        modes_obj["current_active_mode"] = (uid_map.get(DEFAULT_UIDS[5])
+                                            or (modes_obj["order"] or [None])[0])
+    return ({t: m["uid"] for t, m in assigned.items()}, len(kept), dropped)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="渲染 CoolerControl 模板（config.toml / modes.json）",
@@ -487,6 +651,14 @@ def main():
                     help="CPU 温度所在设备的显示名（[devices] 段）")
     ap.add_argument("--case-temp-device-name", default="",
                     help="机箱温度所在设备的显示名（[devices] 段）")
+    ap.add_argument("--merge-modes", default="", metavar="PATH",
+                    help="★ 与【已存在的 modes.json】合并：继承其 Mode 的 uid / name / "
+                         "order / current_active_mode，只把内容换成渲染结果 ⇒ 内容正确 + "
+                         "你在 Web UI 里自建的模式不丢。推荐 "
+                         "--merge-modes /etc/coolercontrol/modes.json")
+    ap.add_argument("--rename-modes", action="store_true",
+                    help="--merge-modes 时把 Mode 名字重写成与实际转速一致"
+                         "（hs 低速 25% / hs 标准 55% / hs 强劲 100%）")
     ap.add_argument("--out-dir", default="",
                     help="输出目录（默认 /etc/coolercontrol）")
     ap.add_argument("--fixed-pct", default="",
@@ -717,6 +889,7 @@ def main():
     })
     # ★ 保留用户在 UI 里手调过的转速（否则一渲染就被打回模板默认值）
     fixed_expect = {}
+    fixed_pct_map = {}
     if args.fixed_pct:
         vals = [v.strip() for v in args.fixed_pct.split(",")]
         if len(vals) != 3:
@@ -730,6 +903,7 @@ def main():
             else:
                 info(f"⚠ 未找到 profile {uid}，跳过转速覆盖")
             fixed_expect[uid] = int(v)
+            fixed_pct_map[uid] = int(v)
     if args.fallback_pct:
         vals = [v.strip() for v in args.fallback_pct.split(",")]
         if len(vals) != 2:
@@ -755,7 +929,35 @@ def main():
             for dev in m["all_device_settings"].values():
                 dev.pop(case_ch, None)
         modes_text = json.dumps(modes_obj, ensure_ascii=False, indent=2)
-    validate_modes(modes_obj, expect_channels=expect_channels)
+
+    # ── ★ 与现有 modes.json 合并（--merge-modes）───────────────────────
+    merged_uids = {}
+    final_uids = dict(DEFAULT_UIDS)
+    if args.merge_modes:
+        ex_path = args.merge_modes
+        if not os.path.isfile(ex_path):
+            die(f"--merge-modes 指定的文件不存在：{ex_path}")
+        try:
+            with open(ex_path, encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception as e:
+            die(f"--merge-modes 读取/解析失败（{ex_path}）：{e}")
+        info(f"合并现有 modes.json：{ex_path}"
+             f"（{len(existing.get('modes') or [])} 个 Mode）")
+        merged_uids, n_keep, n_drop = merge_modes(
+            modes_obj, existing,
+            fixed_pct={DEFAULT_UIDS[t]: fixed_pct_map[DEFAULT_UIDS[t]]
+                       for t in FAN_MODE_ORDER if DEFAULT_UIDS[t] in fixed_pct_map},
+            rename=args.rename_modes)
+        modes_text = json.dumps(modes_obj, ensure_ascii=False, indent=2)
+        info(f"合并完成：{len(merged_uids)} 档沿用现有 Mode"
+             + (f"，额外保留 {n_keep} 个" if n_keep else "")
+             + (f"，丢弃 {n_drop} 个占位符 Mode" if n_drop else ""))
+        final_uids.update(merged_uids)
+
+    validate_modes(modes_obj,
+                   expect_uids=tuple(final_uids[m_] for m_ in FAN_MODE_ORDER),
+                   expect_channels=expect_channels)
 
     if args.check:
         info("--check：校验全部通过，未写入任何文件")
@@ -767,7 +969,7 @@ def main():
     #   默认指向渲染器产出的 hs-* uid；用户若改用自己在 Web UI 建的模式，
     #   跑 `apply-mode.sh --bind 5=<uid 或 Mode 名字>` 改这里即可，不必重渲染。
     fan_map_text = json.dumps(
-        {str(m_): DEFAULT_UIDS[m_] for m_ in FAN_MODE_ORDER},
+        {str(m_): final_uids[m_] for m_ in FAN_MODE_ORDER},
         ensure_ascii=False, indent=2) + "\n"
     targets = {
         os.path.join(out_dir, "config.toml"): cfg_text,

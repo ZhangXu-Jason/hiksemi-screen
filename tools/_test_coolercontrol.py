@@ -530,8 +530,125 @@ fan4 = { disabled = true }
     ok("sync ③ 查反向档位", "反向档位" in ptxt)
     ok("sync ④ 查重启通道（改完要有人重启 daemon）", "重启通道" in ptxt)
     ok("sync ⑤ 查中间件是否已重启（新代码跑了没）", "中间件是否已重启" in ptxt)
-    ok("sync 提示 install-autostart.sh 用 cp -rn 不覆盖",
-       "不覆盖" in ptxt or "cp -f" in ptxt)
+    ok("sync 提示重跑安装器即可同步（不再是 cp -rn 永不覆盖）",
+       "内容比对同步" in ptxt or "cp -f" in ptxt)
+
+    # ── 13. --merge-modes（保留 UI 自建 Mode + 纠正「名字与内容不符」）──────
+    sec("[13] --merge-modes（保留 UI 自建 Mode，纠正挂错的 profile）")
+    UID_S = "1a700658-89d7-4d03-8443-c9260d1604d9"
+    UID_L = "57070995-90a9-41cc-b0dd-d88c7f4aac34"
+    UID_M = "c89036e4-e6db-4c96-98a8-f8702288959b"
+    UID_H = "52c9453f-9659-4d5b-b9f8-d768f1e028c7"
+    DEVR = "71b063a3608e1f4f066afff5ba8ad37f92375b73d6005164d9e16752347f8742"
+
+    def _ui_mode(uid, name, p3, p2):
+        # junk=True：模拟用户把模板原文直接粘进 UI 建的 Mode（真机上就是这种）
+        ads = {DEVR: {"fan3": {"channel_name": "fan3", "profile_uid": p3},
+                      "fan2": {"channel_name": "fan2", "profile_uid": p2}}}
+        ads["@DEVICE_UID@"] = {
+            "@CPU_CHANNEL@": {"channel_name": "@CPU_CHANNEL@",
+                              "profile_uid": "@CPU_SMART_PROFILE@"}}
+        return {"uid": uid, "name": name, "all_device_settings": ads}
+
+    ui = {"modes": [
+        _ui_mode(UID_S, "hs 智能（CPU 曲线 + 机箱曲线）",
+                 "hs-cpu-graph", "hs-case-graph"),
+        # ★ 真机原样：名字说「低速 25%」，内容却挂着 hs-standard(60%)
+        _ui_mode(UID_L, "hs 低速 25%", "hs-standard", "hs-standard"),
+        _ui_mode(UID_M, "hs 标准 55%", "hs-standard", "hs-standard"),
+        _ui_mode(UID_H, "hs 强劲 100%", "hs-high", "hs-high"),
+    ], "order": [UID_S, UID_L, UID_M, UID_H],
+        "current_active_mode": UID_S, "previous_active_mode": UID_H}
+    ui_p = os.path.join(TMPROOT, "ui-modes.json")
+    with open(ui_p, "w", encoding="utf-8") as f:
+        json.dump(ui, f, ensure_ascii=False)
+
+    d13 = os.path.join(TMPROOT, "merged")
+    rc, out = run_render(["--host", "hs-afs-r1", "--merge-modes", ui_p], d13)
+    ok("--merge-modes 渲染成功", rc == 0, out[-400:])
+    mj = json.load(open(os.path.join(d13, "modes.json"), encoding="utf-8"))
+
+    def profs_of(obj, name):
+        m = next((x for x in obj["modes"] if x["name"] == name), None)
+        if not m:
+            return None
+        return {st["profile_uid"]
+                for dev in m["all_device_settings"].values()
+                for st in dev.values() if isinstance(st, dict)}
+
+    ok("沿用用户在 UI 里建的 Mode uid（模式不丢）",
+       {m["uid"] for m in mj["modes"]} == {UID_S, UID_L, UID_M, UID_H},
+       str([m["uid"][:8] for m in mj["modes"]]))
+    ok("★「名字=低速、内容=60%」的 Mode 被纠正为 hs-low",
+       profs_of(mj, "hs 低速 25%") == {"hs-low"}, str(profs_of(mj, "hs 低速 25%")))
+    ok("「标准」Mode 内容 = hs-standard", profs_of(mj, "hs 标准 55%") == {"hs-standard"})
+    ok("「强劲」Mode 内容 = hs-high", profs_of(mj, "hs 强劲 100%") == {"hs-high"})
+    ok("占位符设备键已被清掉（daemon 认不出的键不能留）",
+       all(k == DEVR for m in mj["modes"] for k in m["all_device_settings"]))
+    ok("保留 order / current_active_mode",
+       mj["order"] == [UID_S, UID_L, UID_M, UID_H]
+       and mj["current_active_mode"] == UID_S)
+    mpj = json.load(open(os.path.join(d13, "hs-fan-mode-map.json"), encoding="utf-8"))
+    ok("映射文件指向用户自建的 UUID（屏幕切档直接命中）",
+       mpj == {"5": UID_S, "2": UID_L, "3": UID_M, "4": UID_H}, str(mpj))
+
+    # --rename-modes + --fixed-pct：名字与实际转速对齐
+    d14 = os.path.join(TMPROOT, "merged-renamed")
+    rc, out = run_render(["--host", "hs-afs-r1", "--merge-modes", ui_p,
+                          "--rename-modes", "--fixed-pct", "30,60,100"], d14)
+    mj2 = json.load(open(os.path.join(d14, "modes.json"), encoding="utf-8"))
+    nn = sorted(m["name"] for m in mj2["modes"])
+    ok("--rename-modes 让名字与实际转速一致（不再「名字 25%、实际 60%」）",
+       any("30%" in n for n in nn) and any("60%" in n for n in nn)
+       and any("100%" in n for n in nn), str(nn))
+    cfg2 = open(os.path.join(d14, "config.toml"), encoding="utf-8").read()
+    ok("--fixed-pct 30,60,100 已写进 profile",
+       "speed_fixed = 30" in cfg2 and "speed_fixed = 60" in cfg2)
+    ok("合并后 uid 无重复", len({m["uid"] for m in mj2["modes"]}) == len(mj2["modes"]))
+
+    # 边界：current_active_mode 指向被丢弃的占位符 Mode → 回落智能档，而不是校验失败
+    junk_p = os.path.join(TMPROOT, "junk-active.json")
+    jd = {"modes": [dict(m) for m in ui["modes"]] + [
+        {"uid": "u-junk", "name": "随便建的", "all_device_settings": {
+            "@DEVICE_UID@": {"@CPU_CHANNEL@": {"channel_name": "@CPU_CHANNEL@",
+                                              "profile_uid": "@P@"}}}}],
+        "order": [UID_S, UID_L, UID_M, UID_H, "u-junk"],
+        "current_active_mode": "u-junk"}
+    with open(junk_p, "w", encoding="utf-8") as f:
+        json.dump(jd, f, ensure_ascii=False)
+    d15 = os.path.join(TMPROOT, "merged-junkactive")
+    rc, out = run_render(["--host", "hs-afs-r1", "--merge-modes", junk_p], d15)
+    cur15 = (json.load(open(os.path.join(d15, "modes.json"), encoding="utf-8"))
+             ["current_active_mode"]) if rc == 0 else None
+    ok("激活项指向被丢弃的占位符 Mode 时回落到智能档（不报错）",
+       rc == 0 and cur15 == UID_S, out[-300:])
+
+    # ── 14. 档位内容一致性诊断 + 重启通道健壮性 ─────────────────────────────
+    sec("[14] 内容一致性诊断（--scan）与重启通道健壮性")
+    env_c = dict(os.environ, CC_MODE_CONFIG=ui_p)
+    env_c.pop("CC_FAN_MODE_MAP", None)
+    p = subprocess.run([sys.executable, MAP, "--scan"],
+                       capture_output=True, text=True, env=env_c)
+    txt = p.stdout + p.stderr
+    ok("--scan 能报出「档位名字与内容不符」（这正是 60% 的根因）",
+       p.returncode != 0 and "内容与档位不符" in txt, txt[-300:])
+    ok("--scan 给出 --merge-modes 修复命令", "--merge-modes" in txt)
+    env_ok = dict(os.environ, CC_MODE_CONFIG=os.path.join(d13, "modes.json"),
+                  CC_FAN_MODE_MAP=os.path.join(d13, "hs-fan-mode-map.json"))
+    p2 = subprocess.run([sys.executable, MAP, "--scan"],
+                        capture_output=True, text=True, env=env_ok)
+    ok("合并后的 modes.json 通过内容一致性检查",
+       p2.returncode == 0, (p2.stdout + p2.stderr)[-300:])
+
+    a2 = open(APPLY, encoding="utf-8", errors="replace").read()
+    ok("重启通道改为模糊匹配（systemd/容器名被改也能命中）",
+       "grep -i -m1 'coolercontrol'" in a2)
+    ok("支持 HIKSEMI_FAN_CC_RESTART 自定义重启命令",
+       "HIKSEMI_FAN_CC_RESTART" in a2)
+    ok("找不到重启通道时非 0 退出（不再假装成功）", "exit 3" in a2)
+    ok("先停 daemon 再写文件（防退出时把旧值刷回）", "cc_ctl_run stop" in a2)
+    ok("回读被改回时自愈重试一次", "重写并再重启一次" in a2)
+    ok("sync ④ 提示 HIKSEMI_FAN_CC_RESTART", "HIKSEMI_FAN_CC_RESTART" in ptxt)
 
 finally:
     shutil.rmtree(TMPROOT, ignore_errors=True)

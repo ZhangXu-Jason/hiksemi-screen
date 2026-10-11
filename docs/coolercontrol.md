@@ -103,8 +103,8 @@ CoolerControl daemon 启动
 | --- | --- | --- |
 | `config.toml` | **模板**：`[devices]` / `[device-settings]` / `[[profiles]]` / `[[functions]]` / `[settings]` | 是（`@DEVICE_UID@`、`@CPU_CHANNEL@`、`@CASE_CHANNEL@`、`@CPU_TEMP_*@`、`@CASE_TEMP_*@`、`@CPU_SMART_PROFILE@`、`@CASE_SMART_PROFILE@`） |
 | `modes.json` | **模板**：4 个 Mode 快照（均**双通道**）+ `order` + `current_active_mode` | 是 |
-| `render-config.py` | 渲染占位符 + 契约自校验（TOML/JSON）+ 原子写 + 自动备份；支持双风扇/单风扇/降级 | — |
-| `apply-mode.sh` | **中间件实际调用的入口**：`apply-mode.sh {5\|2\|3\|4}`；另有 `--scan` / `--bind` / `--current` / `--status`（见 §6.5） | — |
+| `render-config.py` | 渲染占位符 + 契约自校验（TOML/JSON）+ 原子写 + 自动备份；支持双风扇/单风扇/降级；`--merge-modes` 与现有 `modes.json` 合并（保留 UI 自建 Mode）、`--rename-modes` 让名字与实际转速一致（见 §6.7） | — |
+| `apply-mode.sh` | **中间件实际调用的入口**：`apply-mode.sh {5\|2\|3\|4}`；另有 `--scan` / `--bind` / `--current` / `--status`（见 §6.5）。重启通道**模糊匹配** systemd/docker，支持 `HIKSEMI_FAN_CC_RESTART`；找不到重启通道**非 0 退出** | — |
 | `fan-mode-map.py` | ★ 档位 ↔ Mode 映射解析器：`--scan` / `--bind` / `--resolve` / `--reverse`（**自建 Mode 也不会失去同步**） | — |
 | `hs-fan-mode-map.json` | 渲染时生成的绑定文件（4 档 → `hs-*` uid），`--bind` 会改写它 | — |
 | `probe-coolercontrol.sh` | 只读探测真机：安装形态 / 端口 / 真实 uid / **真实通道名 fanN** / CPU 与机箱温度源；`modes` 子命令 = 诊断「Mode 在 UI 里空白」（见 §6.4） | — |
@@ -134,7 +134,7 @@ docker run -d --name coolercontrol --privileged \
 # ── 1. 部署本目录到 /screen/tools/coolercontrol ───────────
 #    ★ 推荐：sudo bash install-autostart.sh --fan-coolercontrol on
 sudo mkdir -p /screen/tools/coolercontrol
-sudo cp -rn tools/coolercontrol/* /screen/tools/coolercontrol/
+sudo cp -f  tools/coolercontrol/* /screen/tools/coolercontrol/
 sudo chmod +x /screen/tools/coolercontrol/*.sh /screen/tools/coolercontrol/*.py
 
 # ── 2. 探测真机 ───────────────────────────────────────────
@@ -151,7 +151,9 @@ sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 \
 #
 # ★ 更推荐（UID 与通道名都按真机真值对齐，不手抄）：
 # sudo render-config.py --host hs-afs-r1 --auto --config-dir /etc/coolercontrol
-#      --fixed-pct 30,60,100     保留手调过的三档转速（默认 25,55,100）
+#      --merge-modes /etc/coolercontrol/modes.json   保留你在 UI 里自建的 Mode
+#      --rename-modes            名字改成与实际转速一致（推荐）
+#      --fixed-pct 25,55,100     三档固定转速（默认就是 25,55,100）
 #      --fallback-pct 30,35      保留手调过的兜底转速（默认 35,40）
 
 # 渲染模式的几种开关（按需）：
@@ -230,6 +232,8 @@ sudo systemctl daemon-reload && sudo systemctl restart hiksemi-sub
 | 12 | ★★★ **通道名是 `fanN`，不是 sysfs 的 `pwmN`** | CoolerControl 对 hwmon 设备一律用 `fan1…fanN` 命名通道。本机 it8613 实际可控通道 = **`fan3`(CPU) / `fan2`(机箱)**（fan4/fan5 已禁用）。**按 `pwm1/pwm2` 写死 ⇒ UI 里 Mode 内容空白，症状与 UID 漂移一模一样**（真机踩过）。通道名的唯一权威来源是 `[device-settings.<uid>]` 段，用 `--auto-channels` 自动取（详见 §2 / §6.4） |
 | 13 | ★★ **`temp_name` 是传感器名，不是设备显示名** | 填 `temp1`（对应 hwmon 的 `temp1_input`），填设备名（如 `Intel(R) Core(TM) i3-N305`）会导致温度源匹配不上。两个设备的传感器可能都叫 `temp1`，靠 `device_uid` 区分 |
 | 14 | ★ **Mode 的 uid 可能被换成随机 UUID** | 在 Web UI 里手工新建的 Mode，uid 是 `1a700658-…` 这种 UUID，不是 `hs-smart`。`apply-mode.sh` 找不到目标 uid 时会**按名字前缀回退匹配**（`hs 智能/低速/标准/强劲`），但推荐直接用渲染产物的语义 uid |
+| 15 | ★★ **Mode 名字 ≠ Mode 内容** | daemon 只认内容（`profile_uid`），名字纯展示。真机出现过「名字 `hs 低速 25%`、内容却挂 `hs-standard`(60%)」⇒ 屏幕切「低速」实际跑 60%，看起来像切档无效。判别 = `fan-mode-map.py --scan`（会标红「内容与档位不符」）；修复 = `render-config.py --auto --merge-modes <modes.json> --rename-modes`（详见 §6.7） |
+| 16 | ★★ **重启通道必须模糊匹配** | daemon 可能是 systemd 服务，也可能是 docker 容器，**名字都可能被编排工具改掉**（`coolercontrol-1` / compose 前缀 / 自定义）。只精确匹配固定名字 ⇒ 「配置文件写成功、但没人重启」⇒ 切档不生效（症状 = 屏幕与 CC 不同步）。`apply-mode.sh` 现在按 `-i coolercontrol` 模糊匹配 systemd 单元与 docker 容器，并支持 `HIKSEMI_FAN_CC_RESTART` 指定任意重启命令；**找不到重启通道时非 0 退出**（不再假装成功） |
 
 ### 6.1 反序列化方式（为什么键是蛇形）
 
@@ -410,9 +414,11 @@ sudo /screen/tools/coolercontrol/apply-mode.sh --status
 > ★ 每次切档都要**重启 daemon**（`systemctl restart coolercontrold`），
 > 这是 6.x 之前的既定路径（Mode 是启动时读 `current_active_mode` 激活的）。
 >
-> ★★ **改了工具脚本不会自动到真机上**：`install-autostart.sh` 用 `cp -rn`
-> （不覆盖已存在文件），所以 `fan-mode-map.py` 之类的新文件必须手工拷过去：
-> `sudo cp -f tools/coolercontrol/* /screen/tools/coolercontrol/`。
+> ★★ **改了工具脚本不会自动到真机上**（旧版安装器用 `cp -rn` 不覆盖）。
+> 现已改成**内容比对同步**：重跑安装器就会把改动同步过去，被覆盖的旧文件
+> 备份为 `*.bak-install-<时间戳>`：
+> `sudo bash /screen/tools/install-autostart.sh --fan-coolercontrol on`
+> 手工兜底则用 `sudo cp -f tools/coolercontrol/* /screen/tools/coolercontrol/`。
 > 同理，**改了 `middleware.py` 必须 `sudo systemctl restart hiksemi-sub`**，
 > 否则反向同步这类新代码根本没在跑。
 
@@ -439,8 +445,55 @@ c89036e4…  hs 标准 55%                      @CPU_CHANNEL@→…（同上，�
 
 | 方案 | 产物 | 代价 |
 | --- | --- | --- |
-| **A. 标准版** | Mode uid = `hs-smart/low/standard/high` | UI 里自建的那 4 个 UUID 模式会被替换 |
-| **B. 保留 UUID 版** | uid/名字沿用你自建的，内容换成正确的 `fan3/fan2` + profile；映射文件指向这些 UUID | UI 里的模式不丢，屏幕直接命中它们 |
+| **A. 一条命令（推荐）** | `render-config.py --auto --merge-modes /etc/coolercontrol/modes.json` —— 自动继承你自建 Mode 的 uid/名字/顺序，只把内容换成正确的 | 无需手工合并，UI 里的模式不丢 |
+| B. 标准版 | Mode uid = `hs-smart/low/standard/high` | UI 里自建的那 4 个 UUID 模式会被替换 |
+| C. 手工版 | 自己写脚本替换 uid | 易错，不推荐 |
+
+### 6.7 ★★ 「选了低速，跑出来却是 60%」—— 名字与内容不符
+
+**症状**：在小屏上选「低速」，CoolerControl 里生效的却是 60%（标准）；
+或反过来在 CC 里点「hs 低速 25%」这个 Mode，风扇转速却是 60%。
+
+**根因**：那份 `modes.json` 里，Mode 的**名字**和**内容**不是一回事：
+
+```
+57070995…  "hs 低速 25%"   ← 名字写着低速
+           fan3 → hs-standard  (60%)   ← 内容却是标准档
+           fan2 → hs-standard  (60%)
+```
+
+名字是给人看的，daemon 只认内容（`profile_uid`）。用户在 UI 里建 Mode 时选错了
+profile（低速/标准都挂到 `hs-standard`），于是一个叫「低速」的模式实际跑 60%。
+
+**判别**（一条只读命令，改任何东西之前先跑）：
+
+```bash
+sudo ./fan-mode-map.py --scan          # 或 apply-mode.sh --scan
+```
+
+它会为每一档打印实际内容，并在不符时标红：
+
+```
+2 低速 → 57070995-90a9-…  hs 低速 25%  [名字匹配]  内容=hs-standard  ⚠ 内容与档位不符（应为 hs-low）
+```
+
+**修复**（一条命令，保留 UI 里的 Mode，只纠正内容）：
+
+```bash
+sudo ./render-config.py --host hs-afs-r1 --auto \
+     --merge-modes /etc/coolercontrol/modes.json --rename-modes
+sudo systemctl restart coolercontrold     # 或 docker restart <容器名>
+sudo ./fan-mode-map.py --scan             # 复查应全绿
+```
+
+- `--merge-modes <现有文件>`：按**名字**认领档位（名字优先于内容，才能把内容纠正回来），
+  继承现有 Mode 的 uid / name / order / current_active_mode。
+- `--rename-modes`：顺便把名字重写成与实际转速一致（`hs 低速 25%` → `hs 低速 30%`），
+  以后不会再出现「名字说 25%、实际 60%」。
+- 想要别的转速：加 `--fixed-pct 低速,标准,强劲`（默认 `25,55,100`）。
+
+> ★ 名字认领的优先级：`hs 低速…` 前缀 → `低速|low|静音` 关键词 → 现有内容里的 profile。
+> 名字完全不相关时才回退到按内容认领。
 
 ## 7. 为什么用「改文件 + 重启」而不是调 REST API
 

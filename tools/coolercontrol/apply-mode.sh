@@ -41,6 +41,13 @@
 #     REST API 需要 daemon 内部 token/会话，且版本间路径会变；
 #     重启是稳定、幂等、可离线回放的路径。切换风扇档位是低频操作，
 #     重启代价（< 2s，风扇短暂回到开机默认后立刻应用新档）可接受。
+#
+# ★★ 重启通道是模糊匹配的（systemd 服务名 / docker 容器名都可能被改）：
+#     HIKSEMI_FAN_CC_RESTART='docker restart my-cc'      # 自定义整条命令
+#     找不到重启通道时会【非 0 退出】并打印排查指引 —— 因为「写文件成功但没人
+#     重启」等于档位没生效，而症状恰好就是「屏幕切档、CoolerControl 没反应」。
+#
+# 退出码：0=成功 / 2=参数或文件问题 / 3=没有可用的重启通道 / 4=设置被改回
 # =============================================================================
 set -uo pipefail
 
@@ -50,16 +57,6 @@ CONFIG_TOML="${CC_CONFIG_TOML:-/etc/coolercontrol/config.toml}"
 # ★ 必须 export：fan-mode-map.py 通过这两个环境变量定位文件
 export CC_MODE_CONFIG="$MODE_CONFIG"
 export CC_CONFIG_TOML="$CONFIG_TOML"
-
-# 容器名 / 服务名候选（按序尝试）
-SERVICE_CANDIDATES=(
-    "coolercontrold"
-    "coolercontrol"
-)
-CONTAINER_CANDIDATES=(
-    "coolercontrol"
-    "coolercontrold"
-)
 
 DRY_RUN=0
 
@@ -118,31 +115,90 @@ EOF
 # ── 选择可用的重启方式 ───────────────────────────────────────────────────────
 have_root() { [ "$(id -u)" -eq 0 ]; }
 
+# ★★ 真机上 CoolerControl 的安装形态五花八门：
+#    · systemd 服务：coolercontrold / coolercontrol（有些发行版叫别的名）
+#    · docker 容器：官方镜像 coolercontrol/coolercontrol，容器名可能被编排工具
+#      改过（coolercontrol-1 / feiniu-coolercontrol / compose 前缀……）
+#    旧实现只精确匹配两个名字 ⇒ 编排改名后「配置文件写成功、但没人重启 daemon」
+#    ⇒ 切档【不生效】⇒ 症状与「屏幕和 CoolerControl 不同步」完全一样。
+#    这里改成【模糊匹配】+ 支持自定义重启命令：
+#      HIKSEMI_FAN_CC_RESTART='docker restart my-cc'
+#      HIKSEMI_FAN_CC_RESTART='systemctl restart coolercontrol.service'
+CC_CTL_KIND=""
+CC_CTL_NAME=""
+
+cc_detect_ctl() {
+    [ -n "$CC_CTL_KIND" ] && return 0
+    if [ -n "${HIKSEMI_FAN_CC_RESTART:-}" ]; then
+        CC_CTL_KIND="custom"; CC_CTL_NAME="$HIKSEMI_FAN_CC_RESTART"
+        return 0
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        local u
+        u="$(systemctl list-unit-files --type=service --plain --no-legend 2>/dev/null \
+             | awk '{print $1}' | grep -i -m1 'coolercontrol' || true)"
+        if [ -n "$u" ]; then
+            CC_CTL_KIND="systemd"; CC_CTL_NAME="${u%.service}"
+            return 0
+        fi
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        local c
+        c="$(docker ps -a --format '{{.Names}}' 2>/dev/null \
+             | grep -i -m1 'coolercontrol' || true)"
+        if [ -z "$c" ]; then   # 容器名改了 → 退一步按镜像名找
+            c="$(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
+                 | grep -i 'coolercontrol' | head -1 | cut -f1 || true)"
+        fi
+        if [ -n "$c" ]; then
+            CC_CTL_KIND="docker"; CC_CTL_NAME="$c"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+cc_ctl_run() {     # $1 = restart | stop | start
+    local act="$1"
+    case "$CC_CTL_KIND" in
+        custom)
+            # 自定义命令只能整条执行；stop/start 无法拆分 ⇒ 只在 restart 时用
+            [ "$act" = "restart" ] || return 0
+            sh -c "$CC_CTL_NAME" ;;
+        systemd) systemctl "$act" "$CC_CTL_NAME" ;;
+        docker)  docker "$act" "$CC_CTL_NAME" ;;
+        *)       return 1 ;;
+    esac
+}
+
+cc_ctl_desc() {
+    case "$CC_CTL_KIND" in
+        custom)  echo "自定义命令：$CC_CTL_NAME" ;;
+        systemd) echo "systemd 服务 $CC_CTL_NAME" ;;
+        docker)  echo "docker 容器 $CC_CTL_NAME" ;;
+        *)       echo "（未探测到）" ;;
+    esac
+}
+
 restart_daemon() {
     if [ "$DRY_RUN" = "1" ]; then
         log "[dry-run] 将重启 CoolerControl daemon"
         return 0
     fi
-    # ① systemd 服务（原生安装）
-    for svc in "${SERVICE_CANDIDATES[@]}"; do
-        if command -v systemctl >/dev/null 2>&1 \
-           && systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
-            log "systemctl restart ${svc}"
-            systemctl restart "$svc" && return 0
-            warn "systemctl restart ${svc} 失败，继续尝试其他方式"
-        fi
-    done
-    # ② Docker 容器
-    if command -v docker >/dev/null 2>&1; then
-        for c in "${CONTAINER_CANDIDATES[@]}"; do
-            if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
-                log "docker restart ${c}"
-                docker restart "$c" && return 0
-                warn "docker restart ${c} 失败"
-            fi
-        done
+    if ! cc_detect_ctl; then
+        warn "未找到 CoolerControl 的 systemd 服务 / docker 容器（模糊匹配也没命中）。"
+        warn "  ⇒ 配置已写入，但【没人重启 daemon ⇒ 档位不会生效】。"
+        warn "     这正是「屏幕切档、CoolerControl 侧没反应」最常见的原因。"
+        warn "  修：把重启命令放进环境变量（service 的 Environment= 里）——"
+        warn "      HIKSEMI_FAN_CC_RESTART='docker restart <容器名>'"
+        warn "      或直接用 HIKSEMI_FAN_APPLY_CMD 指定整条命令。"
+        return 1
     fi
-    warn "未找到 CoolerControl 服务/容器；配置已写入，需手工重启后生效"
+    log "重启 CoolerControl（$(cc_ctl_desc)）"
+    if cc_ctl_run restart; then
+        return 0
+    fi
+    warn "重启失败：$(cc_ctl_desc)"
     return 1
 }
 
@@ -288,7 +344,13 @@ if [ "$DRY_RUN" = "1" ]; then
     log "[dry-run] 将把 current_active_mode 设为 ${MODE_UID}（${MODE_NAME}）"
     rm -f "$TMP"
 else
-    cat "$TMP" > "$MODE_CONFIG" && rm -f "$TMP"
+    # ★★ 顺序：先停 daemon → 再写文件 → 再启动。
+    #   为什么先停：daemon 退出时可能把内存里的旧 current_active_mode 刷回
+    #   modes.json，把我们的改动覆盖掉（症状 =「切了没反应 / 自己又切回去」）。
+    if cc_detect_ctl; then
+        cc_ctl_run stop >/dev/null 2>&1 && sleep 1
+    fi
+    cat "$TMP" > "$MODE_CONFIG"
     log "已设置 current_active_mode = ${MODE_UID}（档位 ${MODE_ARG}=${MODE_NAME}）"
 fi
 
@@ -297,21 +359,47 @@ RC=$?
 
 if [ "$DRY_RUN" = "1" ]; then
     log "[dry-run] 完成（未改动任何文件）"
+    rm -f "$TMP"
     exit 0
 fi
 
-# 尝试回读确认（daemon 已启动的情况下）
+# ── 回读确认 + 一次自愈重试 ────────────────────────────────────────────────
+#   daemon 不同版本在被 stop/start 时对 modes.json 的写法不一致，
+#   这里再兜一次：发现被覆盖就重写 + 重启（只重试一次，避免死循环）。
+read_back() {
+    python3 -c "import json;print(json.load(open('$MODE_CONFIG',encoding='utf-8')).get('current_active_mode',''))" 2>/dev/null
+}
 sleep 1
-if [ -f "$MODE_CONFIG" ]; then
-    NOW="$(python3 -c "import json;print(json.load(open('$MODE_CONFIG',encoding='utf-8')).get('current_active_mode',''))" 2>/dev/null)"
-    if [ "$NOW" = "$MODE_UID" ]; then
-        log "确认：current_active_mode = $NOW"
-    else
-        warn "回读值 $NOW ≠ $MODE_UID（daemon 可能重写了该文件）"
-    fi
+NOW="$(read_back)"
+if [ "$NOW" != "$MODE_UID" ] && [ "$RC" = "0" ]; then
+    warn "回读值 ${NOW:-（空）} ≠ ${MODE_UID}（疑似被 daemon 重写）→ 重写并再重启一次"
+    cc_ctl_run stop >/dev/null 2>&1 || true
+    sleep 1
+    cat "$TMP" > "$MODE_CONFIG"
+    restart_daemon
+    RC=$?
+    sleep 1
+    NOW="$(read_back)"
+fi
+rm -f "$TMP"
+
+if [ "$NOW" = "$MODE_UID" ]; then
+    log "确认生效：current_active_mode = $NOW"
+else
+    warn "回读值 ${NOW:-（空）} ≠ ${MODE_UID}"
 fi
 
-# 成功判据：配置已写入即视为成功（重启失败仅告警，交由 daemon 下次启动生效）
+# 成功判据：配置写入 + daemon 重启成功（否则档位不会真正生效）
 [ -f "$CONFIG_TOML" ] || warn "未找到 $CONFIG_TOML（可能尚未安装）"
+if [ "$RC" != "0" ]; then
+    warn "档位【未真正生效】：配置已写入，但没有可用的重启通道。"
+    warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync"
+    exit 3
+fi
+if [ "$NOW" != "$MODE_UID" ]; then
+    warn "档位可能未生效（current_active_mode 被改回）。"
+    warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync"
+    exit 4
+fi
 log "档位切换完成：${MODE_ARG}(${MODE_NAME}) → ${MODE_UID}"
 exit 0

@@ -63,7 +63,50 @@ NAME_KEYS = {
 MODES_DEFAULT = "/etc/coolercontrol/modes.json"
 MAP_FILENAME = "hs-fan-mode-map.json"
 
+# ★ 每一档「正确的内容」长什么样（用于发现"名字与内容不符"）
+#   真机踩过的坑：Mode 名字写着 hs 低速 25%，里面挂的却是 hs-standard(60%)
+#   ⇒ 屏幕切「低速」实际跑 60%，看起来像切档没生效，其实是数据错了。
+TIER_EXPECT = {
+    5: {"hs-smart", "hs-cpu-graph", "hs-case-graph"},
+    2: {"hs-low"},
+    3: {"hs-standard"},
+    4: {"hs-high"},
+}
+
 UID_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def mode_profiles(mode):
+    """收集一个 Mode 所有 channel 引用的 profile_uid / speed_fixed 描述"""
+    profs, fixed = set(), []
+    for dev in (mode.get("all_device_settings") or {}).values():
+        if not isinstance(dev, dict):
+            continue
+        for st in dev.values():
+            if not isinstance(st, dict):
+                continue
+            if st.get("profile_uid"):
+                profs.add(str(st["profile_uid"]))
+            elif "speed_fixed" in st:
+                fixed.append(f"{st['speed_fixed']}%")
+    return profs, sorted(set(fixed))
+
+
+def content_mismatch(mode, tier):
+    """判断 Mode 内容是否与档位相符。返回 (描述, 是否不符)"""
+    profs, fixed = mode_profiles(mode)
+    shown = []
+    if profs:
+        shown.extend(sorted(profs))
+    if fixed:
+        shown.append("Fixed " + "/".join(fixed))
+    desc = ", ".join(shown) or "（空）"
+    bad = [p for p in profs if p not in TIER_EXPECT.get(tier, set())]
+    if not profs and not fixed:
+        return desc, True
+    if fixed and tier in (2, 3, 4):
+        return desc, False          # 直接写死转速也算有效内容
+    return desc, bool(bad)
 
 
 def modes_path():
@@ -263,22 +306,42 @@ def cmd_scan():
               f"{chans[:40]}{mark}")
     print("\n档位绑定解析：")
     rc = 0
+    by_uid2 = _index_by_uid(modes)
+    mismatched = []
     for m_ in FAN_MODE_ORDER:
         u = resolve(m_, modes, mp)
         src = "显式绑定" if mp.get(str(m_)) else ("默认 uid" if u == DEFAULT_UIDS.get(m_) else "名字匹配")
         if u:
-            nm = (_index_by_uid(modes).get(u) or {}).get("name", "?")
-            print(f"  {m_} {FAN_MODES[m_]:<4} → {u[:36]:<38} {nm[:24]:<26} [{src}]")
+            mm = by_uid2.get(u) or {}
+            nm = mm.get("name", "?")
+            desc, badc = content_mismatch(mm, m_)
+            flag = ""
+            if badc:
+                flag = ("  \033[31m⚠ 内容与档位不符（应为 "
+                        + "/".join(sorted(TIER_EXPECT.get(m_, ()))) + "）\033[0m")
+                mismatched.append((m_, nm, desc))
+                rc = 1
+            print(f"  {m_} {FAN_MODES[m_]:<4} → {str(u)[:36]:<38} {str(nm)[:24]:<26} "
+                  f"[{src}]  内容={desc}{flag}")
         else:
             print(f"  {m_} {FAN_MODES[m_]:<4} → \033[31m未匹配\033[0m"
                   f"  ← 用 --bind 绑定，或把 Mode 名字改成含「{FAN_MODES[m_]}」")
             rc = 1
+    if mismatched:
+        print("\n\033[31m✗ 档位名字与内容不符\033[0m —— 屏幕切到这一档会跑成别的转速"
+              "（例如「低速」实际 60%）：")
+        for m_, nm, desc in mismatched:
+            print(f"    档位 {m_}（{FAN_MODES[m_]}）绑定的 Mode「{nm}」里面是 {desc}")
+        print("    修（一条命令，保留你在 UI 里的 Mode，只纠正内容）：")
+        print("      sudo ./render-config.py --host <机型> --auto \\")
+        print(f"           --merge-modes {p} --rename-modes")
     if bad:
         rc = 1
         print(f"\n\033[31m✗ 发现 {len(bad)} 处非法设备键（占位符残留？）\033[0m")
         for u, k in bad[:6]:
             print(f"    Mode {str(u)[:12]}… 键 {k!r}")
-        print("    这些键会让 daemon 无法识别该 Mode ⇒ 重新渲染或手工删掉这些键")
+        print("    这些键会让 daemon 无法识别该 Mode ⇒ 用 render-config.py "
+              "--merge-modes 重新渲染")
     return rc
 
 

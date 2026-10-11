@@ -222,7 +222,7 @@ mkdir -p "$APP/resources/app/dist/theme-static" "$(dirname "$SVC")"
 echo '{"themes":[]}' > "$APP/resources/app/dist/theme-static/config.json"
 : > "$APP/resources/app/dist/theme-static/default-theme.zip"
 
-# 注意：不要预置 config.toml —— 先验证"模板未渲染"提示，再在 [3] 验证 cp -rn 不覆盖
+# 注意：不要预置 config.toml —— 先验证"模板未渲染"提示，再在 [3] 验证重装同步语义
 
 OUT1="$(HIKSEMI_INSTALL_SKIP_SYSTEM=1 HIKSEMI_LOG_DIR="$LOGD" HIKSEMI_SERVICE_DST="$SVC" \
         bash "$INSTALLER" --dir "$APP" --tools-dir "$TOOLS" \
@@ -341,16 +341,36 @@ esac
 echo ""
 echo "── [3] 重装幂等性 ──"
 # ─────────────────────────────────────────────────────────────
-# 模拟"设备上已经渲染过 config.toml"，验证 cp -rn 不覆盖用户/设备数据
+# 模拟三件事，验证新的 sync_tree 语义（★ 旧的 cp -rn 会让真机旧脚本永不更新）：
+#   ① 设备上还是【旧脚本】（历史上"改了没效果"的根源）→ 必须被更新且留备份
+#   ② 设备上的 config.toml 是模板类文件 → 会被模板覆盖（旧文件留 .bak-install-*）
+#   ③ 用户手调过的 data-mapping.json（.json）→ 【不覆盖】，源版本另存 .new
 printf 'SENTINEL-DO-NOT-CLOBBER\n' > "$TOOLS/coolercontrol/config.toml"
+printf '#!/bin/bash\n# OLD-APPLY-MODE\n' > "$TOOLS/coolercontrol/apply-mode.sh"
+printf '{"x":"USER-TUNED"}\n' > "$TOOLS/middleware/data-mapping.json"
 OUT1B="$(HIKSEMI_INSTALL_SKIP_SYSTEM=1 HIKSEMI_LOG_DIR="$LOGD" HIKSEMI_SERVICE_DST="$SVC" \
          bash "$INSTALLER" --dir "$APP" --tools-dir "$TOOLS" \
          --fan-coolercontrol on 2>&1)"
 _t "重装退出码 0" "0" "$?"
 _t "重装后开关行仍只有一行" "1" \
    "$(grep -c '^Environment=HIKSEMI_FAN_COOLERCONTROL=' "$SVC")"
-_t "重装后已渲染的 config.toml 未被覆盖（cp -rn）" \
-   "SENTINEL-DO-NOT-CLOBBER" "$(head -n1 "$TOOLS/coolercontrol/config.toml")"
+# ★ 核心回归：旧脚本必须被【更新】（否则新增功能永远到不了真机）
+_contains "重装后 apply-mode.sh 已更新为新版（含 fan-mode-map.py）" \
+   "$TOOLS/coolercontrol/apply-mode.sh" "fan-mode-map.py"
+_not_contains "旧版 apply-mode.sh 内容已被替换" \
+   "$TOOLS/coolercontrol/apply-mode.sh" "OLD-APPLY-MODE"
+_t "被覆盖的旧脚本留有 .bak-install 备份" "1" \
+   "$(grep -l 'OLD-APPLY-MODE' "$TOOLS"/coolercontrol/apply-mode.sh.bak-install-* 2>/dev/null | wc -l | tr -d ' ')"
+# 模板类文件：config.toml 会被模板覆盖，旧内容进备份
+_not_contains "重装后 config.toml 已被模板覆盖（不含旧哨兵）" \
+   "$TOOLS/coolercontrol/config.toml" "SENTINEL-DO-NOT-CLOBBER"
+_t "被覆盖的 config.toml 留有 .bak-install 备份" "1" \
+   "$(grep -l 'SENTINEL-DO-NOT-CLOBBER' "$TOOLS"/coolercontrol/config.toml.bak-install-* 2>/dev/null | wc -l | tr -d ' ')"
+# 用户可调配置：.json 不覆盖
+_contains "用户手调的 data-mapping.json 未被覆盖" \
+   "$TOOLS/middleware/data-mapping.json" "USER-TUNED"
+_exists "data-mapping.json 新版本另存为 .new" \
+   "$TOOLS/middleware/data-mapping.json.new"
 _t "重装后 middleware.py.orig 备份已存在" "yes" \
    "$([ -f "$TOOLS/middleware/middleware.py.orig" ] && echo yes || echo no)"
 

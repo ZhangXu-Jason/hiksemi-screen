@@ -72,6 +72,53 @@ warn() { echo -e "${Y}[!!]${N} $1"; }
 err()  { echo -e "${R}[XX]${N} $1"; }
 info() { echo -e "${B}[--]${N} $1"; }
 
+# ── ★★ 目录同步：内容不同就覆盖（覆盖前自动备份）────────────────────────────
+#   血泪教训：以前这里用 `cp -rn`（no-clobber）⇒ 设备上的旧脚本【永远不会被更新】。
+#   于是"本地改了、真机没变"：新增的 fan-mode-map.py 缺失、apply-mode.sh 还是旧版、
+#   render-config.py 用的还是旧模板 —— 所有修复在真机上全都白做。
+#   现在：逐文件比较内容（cmp），不同则先备份为 <file>.bak-install-<时间戳> 再覆盖。
+#   ★ *.json（可能是用户手调过的配置，如 data-mapping.json）默认【只报告不覆盖】，
+#     源版本另存为 <file>.new 供手工合并；模板类目录可传 force_json=1 强制同步。
+sync_tree() {
+    local src="$1" dst="$2" force_json="${3:-0}"
+    [ -d "$src" ] || { info "[跳过] 源目录不存在：$src"; return 0; }
+    local n_new=0 n_upd=0 n_keep=0 n_same=0 f rel tgt ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$dst"
+    while IFS= read -r f; do
+        rel="${f#"$src"/}"
+        case "$rel" in __pycache__/*|*.pyc|*.pyo) continue ;; esac
+        tgt="$dst/$rel"
+        mkdir -p "$(dirname "$tgt")"
+        if [ ! -e "$tgt" ]; then
+            cp -p "$f" "$tgt" 2>/dev/null && n_new=$((n_new+1)) \
+                || warn "  复制失败：$rel"
+            continue
+        fi
+        if cmp -s "$f" "$tgt" 2>/dev/null; then n_same=$((n_same+1)); continue; fi
+        case "$rel" in
+            *.json|*.jsonc)
+                if [ "$force_json" != "1" ]; then
+                    cp -p "$f" "$tgt.new" 2>/dev/null || true
+                    warn "  $rel 与源不同（可能你手调过）→ 保留原文件，新版本存为 $rel.new"
+                    n_keep=$((n_keep+1))
+                    continue
+                fi
+                ;;
+        esac
+        cp -p "$tgt" "$tgt.bak-install-$ts" 2>/dev/null || true
+        cp -p "$f" "$tgt" 2>/dev/null && n_upd=$((n_upd+1)) \
+            || warn "  更新失败：$rel"
+    done < <(find "$src" -type f 2>/dev/null)
+    if [ "$n_new" -gt 0 ] || [ "$n_upd" -gt 0 ]; then
+        ok "同步 $src → $dst：新增 $n_new / 更新 $n_upd（旧文件已备份为 *.bak-install-$ts）"
+    else
+        info "同步 $src → $dst：无变化（未变 $n_same）"
+    fi
+    [ "$n_keep" -gt 0 ] && info "  有 $n_keep 个 .json 未覆盖（源版本另存为 *.new，请手工合并）"
+    return 0
+}
+
 # 是否允许「系统级动作」（dry-run 与 SKIP_SYSTEM 均禁止）
 SYS_OK=1
 [ "$DRY_RUN" = "1" ] && SYS_OK=0
@@ -356,8 +403,12 @@ echo "    工具目录（TOOLS_DIR）: $TOOLS_DIR"
 
 # ★ 确定 [SOURCES]：本机仓库里的 middleware 源在哪里（用于首次安装拷贝）
 SRC_MID=""
-for _c in "$TOOLS_DIR/middleware" "$SRC_DIR/middleware" "$APP_DIR/middleware" \
-          "$APP_DIR/tools/middleware"; do
+# ★ 顺序很关键：**必须以脚本自己所在的目录（仓库/发行包）为源**。
+#   旧顺序把 "$TOOLS_DIR/middleware" 排在第一位 ⇒ 第二次安装时源会被解析成
+#   「目标目录自己」⇒ 判定为"就地安装、无需复制" ⇒ **中间件的修复永远同步不过去**
+#   （这正是"本地改了、真机没变"的元凶之一）。tools_dir 只作为兜底候选。
+for _c in "$SRC_DIR/middleware" "$TOOLS_DIR/middleware" \
+          "$APP_DIR/middleware" "$APP_DIR/tools/middleware"; do
     [ -f "$_c/middleware.py" ] && { SRC_MID="$_c"; break; }
 done
 
@@ -367,16 +418,21 @@ MID_DIR="$TOOLS_DIR/middleware"
 # 首次安装：若目标无中间件，但仓库里有源 → 拷过去
 # ★ 就地安装（SRC_MID == MID_DIR）时源目标同一个目录，cp 会报 "same file" 且返回非 0，
 #   set -e 下会中断安装；用 -ef 判定同一性后直接跳过。
+# 同步中间件：★ 以前只在"目标不存在"时拷一次，导致中间件的修复永远到不了真机
+#   （改了中间件却没生效 = 「反向同步」这类新功能根本没跑）。现在改为内容比对同步，
+#   被覆盖的旧文件留 .bak-install-<时间戳>。data-mapping.json 属用户可调配置，
+#   默认不覆盖（源版本存为 .new 供手工合并）。
 if [ "$SRC_MID" -ef "$MID_DIR" ]; then
     info "中间件已在工具目录内（就地安装，无需复制）"
-elif [ ! -f "$MID_DIR/middleware.py" ] && [ -n "$SRC_MID" ]; then
-    if [ "$FILE_OK" = "1" ]; then
-        echo "    首次安装：复制中间件 $SRC_MID → $MID_DIR"
-        mkdir -p "$MID_DIR"
-        cp -rn "$SRC_MID/." "$MID_DIR/" 2>/dev/null || true
-    else
-        info "[跳过] 复制中间件 $SRC_MID → $MID_DIR"
+elif [ -n "$SRC_MID" ] && [ "$FILE_OK" = "1" ]; then
+    # ★ 先留存"升级前"副本再同步（顺序不能反，否则 .orig 会变成新版本）
+    if [ ! -f "$MID_DIR/middleware.py.orig" ] && [ -f "$MID_DIR/middleware.py" ]; then
+        cp -f "$MID_DIR/middleware.py" "$MID_DIR/middleware.py.orig" 2>/dev/null && \
+            info "已留存升级前副本 middleware.py.orig（便于回滚）"
     fi
+    sync_tree "$SRC_MID" "$MID_DIR" 0
+else
+    info "[跳过] 复制中间件 $SRC_MID → $MID_DIR"
 fi
 
 # 兼容兜底：目标仍无，但 $APP_DIR/middleware/ 有 → 用它（老部署不改动）
@@ -497,14 +553,17 @@ if [ ! -d "$SRC_CC" ] && [ "$FAN_CC_ENABLED" = "1" ]; then
 fi
 
 if [ "$FAN_CC_ENABLED" = "1" ]; then
-    # ★ 用 -n（no-clobber）：不覆盖设备上可能已渲染过的文件，重装安全
+    # ★ 用 sync_tree（内容比对 + 备份后覆盖），不用 cp -rn：
+    #   -n 会让真机上的旧脚本永远不更新 —— 新增的 fan-mode-map.py 缺失、
+    #   apply-mode.sh 还是旧版、render-config.py 用的还是旧模板 ⇒ 修复全部白做。
+    #   force_json=1：本目录里的 config.toml/modes.json 是【模板】（渲染的输入），
+    #   必须跟着更新；用户的真实配置在 /etc/coolercontrol，不受影响。
     # ★ 就地安装时 SRC_CC == CC_DST（项目直接放在工具目录下）→ 跳过，避免
     #   "same file" 噪声与非 0 退出（-ef 比字符串相等更准，能识别不同写法同一文件）
     if [ -d "$SRC_CC" ] && [ "$FILE_OK" = "1" ] && [ "$SRC_CC" -ef "$CC_DST" ]; then
         info "coolercontrol 已在工具目录内（就地安装，无需复制）"
     elif [ -d "$SRC_CC" ] && [ "$FILE_OK" = "1" ]; then
-        mkdir -p "$CC_DST"
-        cp -rn "$SRC_CC/." "$CC_DST/" 2>/dev/null || true
+        sync_tree "$SRC_CC" "$CC_DST" 1
     elif [ "$FILE_OK" != "1" ]; then
         info "[跳过] 复制 $SRC_CC/ → $CC_DST/"
     fi

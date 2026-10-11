@@ -92,6 +92,21 @@ sudo ./apply-mode.sh --current                  # 当前激活的 Mode 对应哪
 **反向同步**：中间件读 `modes.json` 的 `current_active_mode` 反查档位，
 在 UI 里手动切了模式，小屏回显会自动跟上（不会反向写回，避免死循环）。
 
+## ★ 「选了低速，跑出来却是 60%」= Mode 名字与内容不符
+
+daemon 只认 Mode 的**内容**（`profile_uid`），名字纯展示。真机踩过：
+一个叫 `hs 低速 25%` 的 Mode 里挂的却是 `hs-standard`(60%) ⇒ 屏幕切「低速」实际跑 60%。
+
+```bash
+sudo ./fan-mode-map.py --scan     # 每档会打印「内容=…」，不符时标红
+sudo ./render-config.py --host hs-afs-r1 --auto \
+     --merge-modes /etc/coolercontrol/modes.json --rename-modes
+sudo systemctl restart coolercontrold        # 或 docker restart <容器名>
+```
+
+`--merge-modes` 按**名字**认领档位（名字优先于内容，才能把内容纠正回来），
+继承现有 Mode 的 uid/名字/顺序；`--rename-modes` 把名字重写成与实际转速一致。
+
 ## 快速开始
 
 ```bash
@@ -99,7 +114,7 @@ sudo ./apply-mode.sh --current                  # 当前激活的 Mode 对应哪
 #    ★ 推荐懒人路线：sudo bash install-autostart.sh --fan-coolercontrol on
 #      （自动部署本目录 + 注入中间件环境变量 + 校验，无需手工敲下面三行）
 sudo mkdir -p /screen/tools/coolercontrol
-sudo cp -rn tools/coolercontrol/* /screen/tools/coolercontrol/
+sudo cp -f  tools/coolercontrol/* /screen/tools/coolercontrol/
 sudo chmod +x /screen/tools/coolercontrol/*.sh /screen/tools/coolercontrol/*.py
 
 # ── 2. 探测真机，拿 device_uid / 双路通道 / 温度源 ─────────
@@ -115,8 +130,15 @@ sudo /screen/tools/coolercontrol/render-config.py --host hs-afs-r1 \
 #    ★ 更推荐（不手抄任何真机参数）：
 # sudo render-config.py --host hs-afs-r1 --auto --config-dir /etc/coolercontrol
 #      --auto = --auto-uid + --auto-channels（UID 与通道名都按真机真值对齐）
-#      --fixed-pct 30,60,100      保留手调过的三档转速（默认 25,55,100）
-#      --fallback-pct 30,35       保留手调过的兜底转速（默认 35,40）
+#      --merge-modes /etc/coolercontrol/modes.json   ★ 保留你在 UI 里自建的 Mode
+#                                                    （只纠正内容，uid/名字/顺序不丢）
+#      --rename-modes              ★ 名字改成与实际转速一致（不再「名字 25%、实际 60%」）
+#      --fixed-pct 25,55,100       三档固定转速（默认 25,55,100）
+#      --fallback-pct 30,35        智能档兜底转速（默认 35,40）
+#
+# ★ 屏幕切档没反应 / 「选了低速却是 60%」→ 先诊断：
+#     sudo ./fan-mode-map.py --scan        # 每档绑定到谁 + 内容与档位是否相符
+#     sudo ./probe-coolercontrol.sh sync   # 五环取证（工具版本/绑定/反向/重启通道/中间件）
 
 # 渲染开关：
 #   --single-channel    单风扇机器（只渲染一路）

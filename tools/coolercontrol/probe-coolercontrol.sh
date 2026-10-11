@@ -55,8 +55,9 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
         MISS=1
     fi
     if [ "$MISS" = "1" ]; then
-        INFO "修复：sudo cp -f <本地>/tools/coolercontrol/* $HERE/"
-        INFO "      sudo chmod +x $HERE/*.sh $HERE/*.py"
+        INFO "修复：重跑安装器（已改为内容比对同步，覆盖的旧文件会备份成 *.bak-install-*）"
+        INFO "      sudo bash $(dirname "$HERE")/install-autostart.sh --fan-coolercontrol on"
+        INFO "      或手工：sudo cp -f <本地>/tools/coolercontrol/* $HERE/"
     fi
 
     SEC "② 档位 → Mode 绑定"
@@ -82,25 +83,34 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     SEC "④ 重启通道（改完配置要有人重启 daemon 才生效）"
     FOUND=0
     if command -v systemctl >/dev/null 2>&1; then
-        for s in coolercontrold coolercontrol; do
-            if systemctl list-unit-files 2>/dev/null | grep -q "^${s}\.service"; then
-                OK "systemd 服务: ${s} ($(systemctl is-active "$s" 2>/dev/null))"
-                INFO "重启命令: sudo systemctl restart ${s}"
-                FOUND=1
-            fi
+        U="$(systemctl list-unit-files --type=service --plain --no-legend 2>/dev/null \
+             | awk '{print $1}' | grep -i 'coolercontrol' || true)"
+        for s in $U; do
+            OK "systemd 服务: $s ($(systemctl is-active "${s%.service}" 2>/dev/null))"
+            INFO "重启命令: sudo systemctl restart ${s%.service}"
+            FOUND=1
         done
     fi
     if command -v docker >/dev/null 2>&1; then
-        DOCK="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i coolercontrol)"
-        if [ -n "$DOCK" ]; then
-            OK "docker 容器: $DOCK"
-            INFO "重启命令: sudo docker restart $DOCK"
-            FOUND=1
+        DOCK="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -i coolercontrol || true)"
+        if [ -z "$DOCK" ]; then
+            DOCK="$(docker ps -a --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
+                    | grep -i coolercontrol | cut -f1 || true)"
         fi
+        for c in $DOCK; do
+            OK "docker 容器: $c（按名字或镜像名模糊匹配）"
+            INFO "重启命令: sudo docker restart $c"
+            FOUND=1
+        done
     fi
-    [ "$FOUND" = "1" ] || NG "既没找到 systemd 服务也没找到 docker 容器
+    if [ "$FOUND" = "0" ]; then
+        NG "既没找到 systemd 服务也没找到 docker 容器
       ⇒ apply-mode.sh 只能写文件、重启不了 ⇒ 切档【不会生效】
-      ⇒ 用 HIKSEMI_FAN_APPLY_CMD 指定你自己的重启命令"
+      ⇒ 屏幕会表现为「切了没反应」。修法（任选其一）：
+         export HIKSEMI_FAN_CC_RESTART='docker restart <容器名>'
+         （写进 hiksemi-sub.service 的 Environment=，
+           或直接在中间件用 HIKSEMI_FAN_APPLY_CMD 指定整条命令）"
+    fi
 
     SEC "⑤ 中间件是否已重启（★ 反向同步是新代码，跑旧进程就不生效）"
     SVC=/etc/systemd/system/hiksemi-sub.service
@@ -133,8 +143,11 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
 
     echo
     INFO "把上面整段输出贴给排障方即可定位。常见结论："
-    INFO "  · ① 有 NG        → 脚本没同步到真机（install-autostart.sh 用 cp -rn 不覆盖）"
+    INFO "  · ① 有 NG        → 脚本没同步到真机（重跑安装器，已改为内容比对同步）"
     INFO "  · ② 有『未匹配』 → 名字不含档位关键词，需 --bind"
+    INFO "  · ② 有『内容与档位不符』→ 该 Mode 挂错了 profile"
+    INFO "        （例如「hs 低速 25%」里居然是 hs-standard=60%）"
+    INFO "        ⇒ 修：render-config.py --auto --merge-modes <modes.json> --rename-modes"
     INFO "  · ③ 有 NG        → 反向档位识别不出，需 --bind"
     INFO "  · ④ 有 NG        → 重启通道缺失，切档只写文件不生效"
     INFO "  · ⑤ 有 NG        → 改了中间件没重启"

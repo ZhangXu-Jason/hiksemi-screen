@@ -131,12 +131,13 @@ ls "$TOOLS/middleware/" 2>/dev/null && echo "[OK] 已在标准位置" \
   || { ls "$APP/tools/middleware/" 2>/dev/null && echo "[!!] 还在程序 tools 下，安装时会自动拷贝到 $TOOLS"; }
 ```
 
-> ★ **无需手动搬**：`install-autostart.sh` 会按 `TOOLS_DIR` 定点拷贝中间件
-> （目标已存在同名文件时用 `cp -rn` 合并，不覆盖）。
+> ★ **无需手动搬**：`install-autostart.sh` 会按 `TOOLS_DIR` 定点同步中间件
+> （**内容比对同步**：不同才覆盖，覆盖前备份 `*.bak-install-*`；
+> 用户可能手调过的 `data-mapping.json` 默认不覆盖，源版本另存 `.new`）。
 > 手动命令仅作为兜底：
 
 ```bash
-sudo mkdir -p "$TOOLS" && sudo cp -rn "$APP/tools/middleware" "$TOOLS/"
+sudo mkdir -p "$TOOLS" && sudo cp -rf "$APP/tools/middleware" "$TOOLS/"
 ```
 
 > 脚本对三处都兼容（`kiosk.sh` 与安装器会按 `HIKSEMI_TOOLS` → `$APP/tools` → `/screen/tools` 顺序探测），
@@ -304,8 +305,8 @@ sudo bash install-autostart.sh --fan-coolercontrol off
 sudo bash install-autostart.sh --fan-coolercontrol on --dry-run
 ```
 
-安装器会：把 `tools/coolercontrol/` 部署到 `$TOOLS/coolercontrol/`（`cp -rn`，
-**不覆盖**设备上已渲染过的配置文件）→ 给脚本补可执行位 → 把
+安装器会：把 `tools/coolercontrol/` 同步到 `$TOOLS/coolercontrol/`（**内容比对同步**，
+不同才覆盖，旧的备份为 `*.bak-install-*`）→ 给脚本补可执行位 → 把
 `Environment=HIKSEMI_FAN_COOLERCONTROL=1 HIKSEMI_FAN_COOLERCONTROL_SCRIPT=$TOOLS/coolercontrol/apply-mode.sh`
 注入 service → 校验注入结果。切换回 `off` 时该行会被**自动清除**。
 
