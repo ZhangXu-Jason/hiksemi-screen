@@ -59,7 +59,7 @@ DEFAULT_KEY = os.path.join(BASE, "key.pem")
 
 # ★ 版本号：每次有行为变更就递增。日志启动段会打印，
 #   用于判断「真机上跑的是哪一版」——排查"改了没生效"时第一眼就看它。
-MIDDLEWARE_VERSION = "2026.10.11-d（散热风扇：切档改为直接写 config.toml，不再重启 daemon）"
+MIDDLEWARE_VERSION = "2026.10.11-e（散热风扇：切档 stop→写 config.toml+modes.json→start，符合 daemon 官方写盘顺序）"
 
 
 def _code_fingerprint():
@@ -1913,9 +1913,10 @@ def apply_to_external_app(state):
                 f"（候选: {FAN_COOLERCONTROL_SCRIPT_CANDIDATES}）", level="quiet")
             return False
         try:
-            # 超时 20s：apply-mode.sh 默认【不重启】（直接写 config.toml 热重载），
-            # 通常 <1s 返回；仅在 --restart 兜底路径下才可能较慢。
-            r = subprocess.run([script, str(mode)], capture_output=True, timeout=20)
+            # 超时 30s：apply-mode.sh v4 会 stop daemon → 写 config.toml → start
+            # （官方顺序：daemon 拥有 config.toml，运行中改会被覆盖）。
+            # stop/start 各需数秒，故放宽到 30s；无 stop/start 通道时退化为直接写，<1s 返回。
+            r = subprocess.run([script, str(mode)], capture_output=True, timeout=30)
             out = (r.stdout or b"").decode(errors="replace").strip()
             err = (r.stderr or b"").decode(errors="replace").strip()
             if r.returncode == 0:

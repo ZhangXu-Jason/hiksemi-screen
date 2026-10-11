@@ -13,15 +13,21 @@
 #     apply-mode.sh --scan            # ★ 列出所有 Mode + 每档当前绑定到谁
 #     apply-mode.sh --bind 5=<uid|名字> 2=…   # ★ 显式绑定档位→Mode
 #     apply-mode.sh --dry-run 3       # 只打印将要做的动作，不落盘
-#     apply-mode.sh --restart 3       # ★ 切档后额外重启 daemon（兜底，默认不重启）
+#     apply-mode.sh --restart 3       # ★ 无 stop/start 通道时的兜底（整条 restart）
 #
-# ★★ 切档如何生效（v3：直接写配置，不重启）：
-#     ① 写 modes.json 的 current_active_mode（"模式"层，UI 一致性 + 开机恢复）；
-#     ② 把该 Mode 的 all_device_settings 【直接写进 config.toml 的 [device-settings]】
-#        —— 这正是 daemon「激活 Mode」时做的事，我们自己做 ⇒ 改完立即一致；
-#     ③ daemon 监视配置文件，会自动热重载 ⇒ **无需重启**。
-#     ★ 只有在热重载不生效（老版本 daemon）时才需要 `--restart` 兜底。
-#     ★ apply_on_boot=true 仍会确保 —— 它是【断电/重启后】恢复档位的保险。
+# ★★ 切档如何生效（v4：stop → 写 config.toml → start）：
+#   ★ 官方文档明确：config.toml 是 daemon 的「所有物」，**运行时改会被覆盖**；
+#     必须「stop → 改 → start」。（docs.coolercontrol.org/daemon/config-files）
+#     ① stop daemon（它把内存态落盘后退出，此后没人会覆盖我们的写）；
+#     ② 写 modes.json 的 current_active_mode（"模式"层，UI/反向同步用）；
+#     ③ 写 config.toml 的 [device-settings.<uid>]（★"生效"层：daemon 启动读它）；
+#     ④ start daemon（按新 [device-settings] 应用）。
+#   ★ 为什么写 config.toml 而不只是 modes.json：daemon 启动时应用的是
+#     config.toml 的 [device-settings]（modes.rs `handle_settings_at_boot`
+#     → "Applying all saved device settings"），**不是** modes.json 的
+#     current_active_mode（那只在 UI/REST 切模式时才被读）。
+#   ★ 前提：apply_on_boot = true（否则 daemon 启动根本不应用 [device-settings]）。
+#   ★ --restart：无 stop/start 通道时的兜底（整条 restart）。
 #
 # 档位映射（与界面一致）：
 #     5 智能 → hs-smart      （CPU 通道=CPU 曲线, 机箱通道=机箱曲线）
@@ -40,16 +46,23 @@
 #   ⇒ 用户在 UI 里随便建模式、随便改名，只要名字里带档位关键词就能认领；
 #     名字完全不相关时，跑一次 `--bind 5=<那个 Mode 的 uid>` 即可。
 #
-# 原理（源码级已确认 activate_mode 语义）：
-#     CoolerControl 的 Mode 就是 config.toml 里 [device-settings] 的具名快照。
-#     激活一个 Mode 会把它的 Setting 写回 config.toml 并应用到引擎。
-#     daemon 在【启动时】读取 modes.json 的 current_active_mode 并激活它，
-#     因此「改 modes.json → 重启 daemon」即可完成切换，无需调用 API。
+# 原理（源码级已确认 activate_mode / handle_settings_at_boot 语义）：
+#     CoolerControl 的 Mode 就是 config.toml 里 [device-settings] 的具名快照
+#     （modes.json 存 Mode 定义 + current_active_mode）。
+#     ★ 激活语义：UI/REST 调 activate_mode() 会把该 Mode 的 Setting 写回
+#       config.toml 的 [device-settings] 并应用到引擎。
+#     ★ 启动语义：daemon 启动时走 modes.rs `handle_settings_at_boot`
+#       → "Applying all saved device settings"，应用的是 **config.toml 的
+#       [device-settings]**（不是 modes.json 的 current_active_mode）。
+#     ⇒ 因此「写 config.toml 的 [device-settings] + 写 modes.json 的
+#       current_active_mode，再 start daemon」才能既生效又被 UI 认到。
 #
-# ★ 为什么用重启而不是调 API：
-#     REST API 需要 daemon 内部 token/会话，且版本间路径会变；
-#     重启是稳定、幂等、可离线回放的路径。切换风扇档位是低频操作，
-#     重启代价（< 2s，风扇短暂回到开机默认后立刻应用新档）可接受。
+# ★ 为什么 stop→写→start，而不是调 REST API / 只写文件：
+#     ① REST API 需要 daemon 内部 token/会话，且版本间路径会变；
+#     ② config.toml 是 daemon 的「所有物」，**运行时改会被它在退出/保存时覆盖**
+#        （官方文档原话）⇒ 必须 stop 后再写；
+#     ③ stop→写→start 稳定、幂等、可离线回放。切档是低频操作，
+#        stop/start 各约 1-2s（风扇短暂回到开机默认后立刻应用新档）可接受。
 #
 # ★★ 重启通道是模糊匹配的（systemd 服务名 / docker 容器名都可能被改）：
 #     HIKSEMI_FAN_CC_RESTART='docker restart my-cc'      # 自定义整条命令
@@ -69,8 +82,8 @@ export CC_MODE_CONFIG="$MODE_CONFIG"
 export CC_CONFIG_TOML="$CONFIG_TOML"
 
 DRY_RUN=0
-# ★ 默认【不重启】daemon：切档靠"直接写 config.toml"生效（daemon 自动热重载）。
-#   仅当显式 --restart 或 HIKSEMI_FAN_CC_RESTART_ON_APPLY=1 时才重启（兜底手段）。
+# ★ v4：切档固定「stop → 写 → start」（官方顺序）。
+#   RESTART=1 仅作为【无独立 stop/start 通道】时的兜底（整条 restart 代替）。
 RESTART=0
 [ "${HIKSEMI_FAN_CC_RESTART_ON_APPLY:-0}" = "1" ] && RESTART=1
 
@@ -466,10 +479,19 @@ open(p, "w", encoding="utf-8").write("".join(lines))
 PY
 }
 
-# ── ★★ 关键：把 Mode 的 all_device_settings 直接写进 config.toml ────────────
-#   daemon 真的在「激活 Mode」时做的就是这件事（把 Mode 快照写回 [device-settings]）。
-#   我们【自己写】就能：① 不依赖 daemon 重启；② 改完立即一致（⑦ 环必绿）。
-#   写的是 modes.json 里这个 Mode 的 all_device_settings，即模式内容的权威来源。
+# ── ★★ 关键：把 Mode 的 all_device_settings 写进 config.toml ────────────────
+#   ★★ 官方文档明确（docs.coolercontrol.org/daemon/config-files）：
+#      「Stop the daemon before editing any of these by hand. The daemon owns these
+#        files and writes them out again on shutdown, so an edit made while it is
+#        running will be overwritten and lost.」
+#      ⇒ config.toml 是 daemon 的「所有物」，**运行时写会被覆盖**；
+#        正确顺序永远是 stop → 写 → start（本脚本 apply_once 已遵守）。
+#   ★ 为什么写 config.toml 而不是只写 modes.json：
+#      daemon 启动时应用的是 config.toml 的 [device-settings]
+#      （modes.rs: handle_settings_at_boot → "Applying all saved device settings"），
+#      **不是** modes.json 的 current_active_mode（那只在 UI/REST 切模式时才读）。
+#      ⇒ 要让"重启后档位还在"，唯一可靠的是把设置落进 config.toml。
+#   ★ 顺带清理模板占位符段 [device-settings."@DEVICE_UID@"]（渲染残留会导致两段并存）。
 write_device_settings() {
     [ -f "$CONFIG_TOML" ] || return 2
     python3 - "$MODE_CONFIG" "$CONFIG_TOML" "$MODE_UID" <<'PY'
@@ -498,7 +520,12 @@ def render_chan(st):
         parts.append(f'speed_fixed = {int(st["speed_fixed"])}')
     return "{ " + ", ".join(parts) + " }" if parts else None
 
-# 对每个设备，构造要写进 [device-settings.<uid>] 的通道行（保持引用引号）
+# ★ 先删除【未渲染的占位符段】（@DEVICE_UID@ 等）——它们是渲染残留，
+#   daemon 读到会当成一个"不存在的设备"，且会与真 uid 段并存造成混乱。
+#   段体 = 段头行 + 其后的非 [ 开头行（到下一个段头为止）。
+txt = re.sub(r'^\[device-settings\.[ \t]*"[^"]*@[^"]*"\][ \t]*\n(?:[^\[]*)',
+             "", txt, flags=re.M)
+
 for dev, chans in ds.items():
     rows = []
     for ch, st in (chans or {}).items():
@@ -508,8 +535,9 @@ for dev, chans in ds.items():
         rows.append(f'"{ch}" = {body}\n')
     if not rows:
         continue
+    # 段体匹配：到「下一个段头」或「连续空行」为止（保留段间的分隔空行）
     sec_re = re.compile(
-        r'^\[device-settings\.(?:"%s"|\'%s\'|%s)\][ \t]*\n(.*?)(?=^\[|\Z)'
+        r'^\[device-settings\.(?:"%s"|\'%s\'|%s)\][ \t]*\n(.*?)(?=\n\[|\Z)'
         % (re.escape(dev), re.escape(dev), re.escape(dev)),
         flags=re.M | re.S)
     m = sec_re.search(txt)
@@ -525,13 +553,26 @@ open(cfg_p, "w", encoding="utf-8").write(txt)
 PY
 }
 
-# 单次「写 modes.json + 写 config.toml」：★ 唯一一处落地动作（重试复用）
-#   ★ 已【不再无条件重启 daemon】：daemon 会监视配置自动热重载；
-#     重启只在显式要求（--restart / HIKSEMI_FAN_CC_RESTART_ON_APPLY=1）时做。
+# ── 单次落地：★ 严格按官方顺序 stop → 写(两个文件) → start ─────────────────
+#   ★★ 为什么必须 stop 在前：config.toml 是 daemon 的「所有物」，
+#      运行时写会被它退出/保存时覆盖掉（官方文档明写）。所以：
+#        stop（daemon 把内存态落盘并退出）→ 我们覆盖写 → start（按新内容应用）。
+#   ★ 只 stop/start 不了（无重启通道）时也【照写】—— 至少 modes.json 是好的；
+#      但 config.toml 的改动可能被覆盖，由后面的回读判据报出来。
 apply_once() {
+    STOPPED=0
+    if cc_detect_ctl; then
+        if cc_ctl_run stop >/dev/null 2>&1; then
+            STOPPED=1
+            sleep 2                      # 等 daemon 真正退出并完成落盘
+        else
+            warn "stop 失败（继续写；config.toml 改动可能被 daemon 覆盖）"
+        fi
+    fi
+    # ★ 写 modes.json（"模式"层：UI 一致性 + 反向同步）
     cat "$TMP" > "$MODE_CONFIG"
     log "已设置 current_active_mode = ${MODE_UID}（档位 ${MODE_ARG}=${MODE_NAME}）"
-    # ★★ 直接把模式内容写进 config.toml ⇒ 无需靠 daemon 重启来"应用"
+    # ★★ 写 config.toml 的 [device-settings]（"生效"层：daemon 启动就是读它）
     if [ -f "$CONFIG_TOML" ]; then
         if write_device_settings; then
             log "已把档位内容写入 config.toml 的 [device-settings]"
@@ -539,32 +580,41 @@ apply_once() {
             warn "写 config.toml 的 [device-settings] 失败（模式可能未真正落地）"
         fi
     fi
-    if [ "$RESTART" = "1" ]; then
-        restart_daemon
+    # ★ start（让 daemon 按新的 [device-settings] 应用）
+    if [ "$STOPPED" = "1" ]; then
+        if cc_ctl_run start >/dev/null 2>&1; then
+            log "已启动 CoolerControl（按新配置应用）"
+        else
+            warn "start 失败：$(cc_ctl_desc)"
+            RC=1
+        fi
+    elif [ "$RESTART" = "1" ]; then
+        restart_daemon || RC=1
     fi
     return 0
 }
 
 if [ "$DRY_RUN" = "1" ]; then
-    log "[dry-run] 将把 current_active_mode 设为 ${MODE_UID}（${MODE_NAME}）"
-    log "[dry-run] 并将档位内容写入 config.toml 的 [device-settings]（不重启 daemon）"
+    log "[dry-run] 将 stop → 写 current_active_mode=${MODE_UID}（${MODE_NAME}）"
+    log "[dry-run]      → 写 config.toml 的 [device-settings] → start"
     log "[dry-run] 完成（未改动任何文件）"
     rm -f "$TMP"
     exit 0
 fi
 
-# ★ apply_on_boot 仍要确保为 true —— 它是【断电/重启后】恢复档位的保险，
-#   与「切档当下是否生效」无关（当下生效靠上面直接写 config.toml）。
+RC=0
+# ★ 确保 apply_on_boot = true —— daemon 启动时【必须】应用 [device-settings]，
+#   否则我们写进去的档位在下次重启后不会被应用。这是整个方案的前提！
 if [ -f "$CONFIG_TOML" ]; then
     if ensure_apply_on_boot; then
-        log "apply_on_boot = true 已确认（开机/daemon 重启后会恢复当前档）"
+        log "apply_on_boot = true 已确认（daemon 启动会应用 [device-settings]）"
     else
         warn "无法确认/设置 apply_on_boot=true（config.toml 只读？）"
     fi
 fi
 
 apply_once; RC=$?
-sleep 1
+sleep 2
 NOW="$(read_back)"
 
 # ★★ 判据核心：config.toml 的真实设置是否【已等于】当前 Mode 内容。
@@ -573,8 +623,10 @@ CFG_OK=2
 if [ -f "$CONFIG_TOML" ]; then
     config_matches_mode; CFG_OK=$?
     if [ "$CFG_OK" = "1" ]; then
-        warn "config.toml 与当前 Mode【不一致】→ 再写一次"
+        warn "config.toml 与当前 Mode【不一致】→ 再落地一次"
         apply_once; RC=$?
+        sleep 2
+        NOW="$(read_back)"
         config_matches_mode; CFG_OK=$?
     fi
 fi
@@ -586,7 +638,7 @@ else
     warn "回读值 ${NOW:-（空）} ≠ ${MODE_UID}"
 fi
 
-# ─── 简洁判据（★ 不再以"能不能重启 daemon"论成败）────────────────────────
+# ─── 简洁判据 ───────────────────────────────────────────────────────────────
 if [ ! -f "$CONFIG_TOML" ]; then
     warn "未找到 $CONFIG_TOML（CoolerControl 未安装？）—— 已只写 modes.json"
     exit 0
@@ -597,8 +649,8 @@ if [ "$CFG_OK" = "0" ]; then
 fi
 # CFG_OK=1/2 ⇒ config.toml 没跟上
 warn "★ config.toml 与 Mode 内容不符（档位可能没真正生效）。"
-warn "  ① 检查是否含 @DEVICE_UID@ 等占位符残留 ⇒ render-config.py --auto 重渲"
+warn "  ① 检查是否有 @DEVICE_UID@ 占位符残留段 ⇒ render-config.py --auto 重渲"
 warn "  ② 确认 Mode 的通道名是 daemon 认识的（fanN，非 pwmN）"
-warn "  ③ 兜底：加 --restart 让 daemon 重启并按 active mode 重写"
+warn "  ③ 确认能 stop/start CoolerControl（写 config.toml 需要先停 daemon）"
 warn "  排查：bash $(dirname "$0")/probe-coolercontrol.sh sync   # 看 ⑦ 环"
 exit 5

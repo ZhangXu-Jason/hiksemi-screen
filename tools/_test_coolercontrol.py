@@ -732,11 +732,10 @@ fan4 = { disabled = true }
        "⑦ config.toml 与 modes.json 是否一致" in ptxt)
     ok("probe ⑦ 有 NG 时给出结论（模式改了配置没跟上）",
        "模式改了但 config.toml 没跟上" in ptxt)
-    ok("probe ⑦ 提示同步新版 apply-mode.sh（直接写 config.toml）",
-       "apply-mode.sh 落地时会【自己写 config.toml】" in ptxt
-       or "自己写 config.toml" in ptxt)
-    ok("probe ④ 标注默认不重启",
-       "--restart 兜底" in ptxt or "默认切档【不重启】" in ptxt)
+    ok("probe ⑦ 提示同步新版 apply-mode.sh（v4：stop→写→start）",
+       "v4 切档 = stop daemon" in ptxt or "stop daemon → 写 config.toml → start" in ptxt)
+    ok("probe ④ 标注需 stop/start 通道（v4 官方顺序）",
+       "stop → 写 config.toml → start" in ptxt or "stop→写→start" in ptxt)
 
     # 提取 ensure_apply_on_boot 独立可执行体，做行为验证
     fn_m = re.search(r"ensure_apply_on_boot\(\) \{.*?\n\}\n", a3, flags=re.S)
@@ -830,16 +829,23 @@ fan4 = { disabled = true }
            run_cm('[device-settings."dev1"]\n"fan3" = { speed_fixed = 25 }\n',
                   "ZZZ") == "rc=1")
 
-    # ── [17] 切档 = 直接写 config.toml，默认不重启 daemon ────────────────────
-    #  核心：① write_device_settings 把 Mode 内容写进 [device-settings]
-    #        ② 与 config_matches_mode 端到端一致（写完即 matches rc=0）
-    #        ③ 默认不重启；--restart / --no-restart / 环境变量可控
-    sec("[17] 切档直接写 config.toml（不重启 daemon）")
+    # ── [17] 切档 = stop daemon → 写 config.toml + modes.json → start ───────
+    #  核心（v4）：① daemon 拥有 config.toml，运行中改会被覆盖 ⇒ 必须 stop→写→start
+    #        ② write_device_settings 把 Mode 内容写进 [device-settings]
+    #        ③ 与 config_matches_mode 端到端一致（写完即 matches rc=0）
+    #        ④ 无 stop/start 通道时，--restart / 环境变量可兜底整条 restart
+    sec("[17] 切档 stop → 写 config.toml → start（官方顺序）")
 
     a4 = open(APPLY, encoding="utf-8", errors="replace").read()
     ok("apply-mode.sh 新增 write_device_settings", "write_device_settings()" in a4)
-    ok("★ 默认不重启：apply_once 里 restart 受 RESTART 开关控制",
-       '[ "$RESTART" = "1" ] &&' in a4 or 'if [ "$RESTART" = "1" ]; then' in a4)
+    ok("★ v4：apply_once 里先 stop 再写（cc_ctl_run stop + STOPPED 标记）",
+       "cc_ctl_run stop" in a4 and "STOPPED=1" in a4)
+    ok("★ v4：写完再 start（cc_ctl_run start 受 STOPPED 控制）",
+       "cc_ctl_run start" in a4 and 'if [ "$STOPPED" = "1" ]' in a4)
+    ok("★ v4：无 stop/start 通道时回退到整条 restart（elif RESTART）",
+       'elif [ "$RESTART" = "1" ]; then' in a4)
+    ok("写两个文件：modes.json（模式层）+ config.toml（生效层）",
+       '"$MODE_CONFIG"' in a4 and "write_device_settings" in a4)
     ok("支持 --restart / --no-restart 参数",
        "--restart)" in a4 and "--no-restart)" in a4)
     ok("支持 HIKSEMI_FAN_CC_RESTART_ON_APPLY 环境变量",

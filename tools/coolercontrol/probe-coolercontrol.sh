@@ -128,7 +128,7 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
         fi
     fi
 
-    SEC "④ 重启通道（★ 默认切档【不重启】；此项仅 --restart 兜底时才需要）"
+    SEC "④ daemon 停/启通道（★ v4 切档 = stop → 写 config.toml → start，必须能停能启）"
     FOUND=0
     if command -v systemctl >/dev/null 2>&1; then
         U="$(systemctl list-unit-files --type=service --plain --no-legend 2>/dev/null \
@@ -153,7 +153,7 @@ if [ "${1:-}" = "sync" ] || [ "${1:-}" = "--sync" ]; then
     fi
     if [ "$FOUND" = "0" ]; then
         NG "既没找到 systemd 服务也没找到 docker 容器
-      ⇒ 若用 --restart 兜底则无法重启；默认路径（直接写 config.toml）不受影响。
+      ⇒ ★ v4 切档要 stop→写→start，找不到通道就只能【整条 restart 兜底】。
       ⇒ 需要兜底时修法（任选其一）：
          export HIKSEMI_FAN_CC_RESTART='docker restart <容器名>'
          （写进 hiksemi-sub.service 的 Environment=，
@@ -298,11 +298,11 @@ if mismatch == 0:
     ok("config.toml 的 [device-settings] 与当前 Mode 内容一致（已真正生效）")
 else:
     ng(f"有 {mismatch} 处不一致 ⇒ 档位【没真正落到 config.toml】")
-    info("  ① 若 apply-mode.sh 不是新版（切档应直接写 config.toml）⇒ 同步工具目录")
-    info("     新版 apply-mode.sh 落地时会【自己写 config.toml】，不依赖重启 daemon")
-    info("  ② 确认 apply-mode.sh 返回 5（写 config.toml 失败）时的告警原因")
+    info("  ①②③ 均先确认工具是新版（v4 切档 = stop daemon → 写 config.toml → start）")
+    info("  ① 若 apply-mode.sh 不是新版 ⇒ 同步工具目录")
+    info("  ② apply-mode.sh 返回 5 = 写完回读仍不一致（⑨ 环会 NG），按告警原因查")
     info("  ③ 若配置里有 @DEVICE_UID@ 等占位符残留 ⇒ render-config.py --auto 重渲")
-    info("  ④ 兜底：apply-mode.sh --restart <mode>（让 daemon 重启并按 active mode 重写）")
+    info("  ④ 兜底：apply-mode.sh --restart <mode>（整条重启 daemon，慎用）")
 PY
     else
         INFO "缺少 python3 或 fan-mode-map.py，跳过"
@@ -316,7 +316,7 @@ PY
     INFO "        （例如「hs 低速 25%」里居然是 hs-standard=60%）"
     INFO "        ⇒ 修：render-config.py --auto --merge-modes <modes.json> --rename-modes"
     INFO "  · ③ 有 NG        → 反向档位识别不出，需 --bind"
-    INFO "  · ④ 有 NG        → 无重启通道（仅 --restart 兜底时才需要；默认切档不重启）"
+    INFO "  · ④ 有 NG        → 找不到 daemon 停/启通道（v4 切档需 stop→写→start；缺则只能整条 restart 兜底）"
     INFO "  · ⑤ 有 NG        → 改了中间件没重启"
     INFO "  · ⑥ 有 NG        → 反向同步/规则模块缺失 ⇒ 屏幕切档会自己弹回"
     INFO "  · ⑦ 有 NG        → 模式改了但 config.toml 没跟上（档位没真正生效）"
@@ -623,24 +623,32 @@ for h in /sys/class/hwmon/hwmon*; do
 done
 [ "$FOUND_ANY" = "0" ] && NG "未发现任何 pwm*/fan*_input（风扇可能由 EC 管理，不走 hwmon）"
 
-# ★ 双风扇候选：取该设备下所有 pwmN（对应 CoolerControl 的 fanN）。
-#   本机 it8613 实测 fan1..fan5，仅 fan2/fan3 实接风扇（fan4/fan5 在 UI 里已禁用）。
-#   ⇒ 具体用哪两路以 config.toml 的 [device-settings] 为准（见 §3 / §5.1）。
+# ★ 双风扇候选：★ CoolerControl 通道名 = fanN，与【sysfs 的 pwmN 编号不一定一致】。
+#   可靠做法：从【该设备下真实存在的 pwmN】推出 pwm 编号集合，再交叉 tach(fanN_input)。
+#   ★★ 绝不能用「路数」去猜名字（如 4 路 ⇒ fan1…fan4）——本机 pwm 是 2,3,4,5，
+#      却只有 fan2/fan3/fan4 有 tach，凑出来的 fan5 根本不存在（真机踩过）。
+#   最终以 §5.1（config.toml 的 [device-settings]）为权威。
 for h in /sys/class/hwmon/hwmon*; do
     [ -d "$h" ] || continue
     [ "$(cat "$h/name" 2>/dev/null)" = "it8613" ] || continue
-    PWMS="$(ls "$h" 2>/dev/null | grep -E '^pwm[0-9]+$' | sort)"
-    N="$(printf '%s\n' "$PWMS" | grep -c .)"
-    if [ "$N" -ge 2 ]; then
-        LAST="$(printf '%s\n' "$PWMS" | tail -1)"
-        CHANNEL="$(printf '%s\n' "$PWMS" | sed -n 1p)"
-        CASE_CHANNEL="$LAST"
-        OK "检测到 $N 路 PWM → 候选通道 fan1…fan$N（CoolerControl 通道名）"
-        INFO "★ 默认取首尾两路：cpu_channel=${CHANNEL/pwm/fan}  case_channel=${CASE_CHANNEL/pwm/fan}"
-        INFO "  ⚠ 这只是候选！真正的通道名以 §5.1「daemon 实际写入的通道」为准。"
-    elif [ "$N" -eq 1 ]; then
-        CHANNEL="$(printf '%s\n' "$PWMS" | sed -n 1p)"
-        INFO "只检测到 1 路 PWM（$CHANNEL）→ 单风扇，渲染时加 --single-channel"
+    PWMS="$(ls "$h" 2>/dev/null | grep -E '^pwm[0-9]+$' | sed 's/^pwm//' | sort -n)"
+    FANS="$(ls "$h" 2>/dev/null | grep -E '^fan[0-9]+_input$' | sed 's/^fan//;s/_input$//' | sort -n)"
+    N_PWM="$(printf '%s\n' "$PWMS" | grep -c .)"
+    N_FAN="$(printf '%s\n' "$FANS" | grep -c .)"
+    if [ "$N_PWM" -ge 1 ]; then
+        # 只按【真实编号】列出，不做「路数→fan1..fanN」的臆测
+        INFO "it8613 真实 pwm 编号: [$(printf '%s' "$PWMS" | tr '\n' ' ')]（共 $N_PWM 路）"
+        [ "$N_FAN" -gt 0 ] && \
+            INFO "it8613 真实 tach(fanN_input) 编号: [$(printf '%s' "$FANS" | tr '\n' ' ')]（共 $N_FAN 路）"
+        # 有 tach 的通道才是「接了风扇」的强候选（pwm 有但无 tach 多为空路）
+        if [ "$N_FAN" -ge 2 ]; then
+            INFO "★ 有测速反馈的候选通道: $(printf '%s' "$FANS" | sed 's/^/fan/;s/$/ /g' | tr -d '\n')"
+            INFO "  ⚠ 哪个是 CPU、哪个是机箱【无法从 sysfs 判断】（接线决定）"
+        elif [ "$N_PWM" = "1" ]; then
+            INFO "只 1 路 PWM → 单风扇，渲染时加 --single-channel"
+        fi
+        INFO "  ★ 通道名的【唯一权威】是 §5.1（config.toml [device-settings]），"
+        INFO "    用 render-config.py --auto 自动取真值，不要按本节的编号手写。"
     fi
 done
 
@@ -680,8 +688,9 @@ done
 # ── 7. 汇总：可直接复制的渲染命令 ────────────────────────────────────────────
 SEC "7. 汇总"
 echo "  device_uid        : ${DEVICE_UID:-<请在 Web UI → System 中查看，或读 config.toml>}"
-echo "  cpu_channel       : ${CHANNEL:-<见 §5.1（daemon 实际写入的通道名）>}"
-echo "  case_channel      : ${CASE_CHANNEL:-<双风扇时第二路；单风扇留空>}"
+echo "  cpu_channel       : <见 §5.1（[device-settings] 里 daemon 实际写的 fanN）>"
+echo "  case_channel      : <见 §5.1（同上；单风扇留空/加 --single-channel）>"
+echo "    ★ 通道名不要按 §5 的 pwmN/fanN 编号手写（编号≠通道名，且无法从 sysfs 判角色）"
 echo "  cpu_temp_name     : temp1   ← ★ CoolerControl 的 temp_name 是【传感器名】，"
 echo "                               对应 hwmon 的 temp1_input，不是设备显示名"
 echo "  cpu_temp_dev_uid  : ${CPU_TEMP_DEVICE_UID:-<Web UI 中该传感器所在设备 UID>}"
@@ -690,6 +699,8 @@ echo "  case_temp_dev_uid : ${CASE_TEMP_DEVICE_UID:-<同上>}"
 echo
 echo "  ★ 最省事：sudo ./render-config.py --host hs-afs-r1 --auto --config-dir $CC_CONF_DIR"
 echo "    （--auto = --auto-uid + --auto-channels，UID 与通道名全部按真机真值对齐）"
+echo "  ★ 另：config.toml 里若残留 [device-settings.\"@DEVICE_UID@\"] 占位符段，"
+echo "    说明渲染不干净 —— 用 --auto 重渲（apply-mode.sh 落地时也会自动清掉它）。"
 
 if [ "$SHORT" = "1" ]; then
     echo
